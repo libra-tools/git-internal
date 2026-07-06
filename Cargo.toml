@@ -1,6 +1,6 @@
 [package]
 name = "git-internal"
-version = "0.8.0"
+version = "0.8.2"
 edition = "2024"
 authors = ["Eli Ma <genedna@gmail.com>"]
 description = "High-performance Rust library for Git internal objects, Pack files, and AI-assisted development objects (Intent, Plan, Task, Run, Evidence, Decision) with delta compression, streaming I/O, and smart protocol support."
