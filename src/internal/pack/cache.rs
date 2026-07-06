@@ -308,18 +308,29 @@ impl _Cache for Caches {
             self.insert_lru_resident(&mut map, hash, a_obj);
         } else {
             // ? whether insert to cache directly or only write to tmp file
-            let mut map = self.lru_cache.lock().unwrap();
-            let mut a_obj = ArcWrapper::new(
-                obj_arc.clone(),
-                self.complete_signal.clone(),
-                Some(self.pool.clone()),
-            );
-            if self.mem_size.is_some() {
-                a_obj.set_store_path(self.generate_temp_path(&self.tmp_path, hash));
+            //
+            // Scope the `lru_cache` guard so it is released BEFORE we write
+            // `map_offset` below. Holding lru across the `map_offset` DashMap
+            // write, while get_by_offset() takes the `map_offset` shard read
+            // lock and then locks lru, is an ABBA lock-order inversion that
+            // deadlocks concurrent pack decoding. (This inner scope existed in
+            // 0.7.6 and was lost when insert was refactored to use
+            // `insert_lru_resident`; its removal introduced the deadlock.)
+            {
+                let mut map = self.lru_cache.lock().unwrap();
+                let mut a_obj = ArcWrapper::new(
+                    obj_arc.clone(),
+                    self.complete_signal.clone(),
+                    Some(self.pool.clone()),
+                );
+                if self.mem_size.is_some() {
+                    a_obj.set_store_path(self.generate_temp_path(&self.tmp_path, hash));
+                }
+                self.insert_lru_resident(&mut map, hash, a_obj);
             }
-            self.insert_lru_resident(&mut map, hash, a_obj);
             self.hash_set.insert(hash);
-            // order matters as for reading in 'get_by_offset()'
+            // order matters as for reading in 'get_by_offset()': the object is
+            // made resident in lru above before its offset becomes visible here.
             self.map_offset.insert(offset, hash);
         }
 
@@ -328,17 +339,21 @@ impl _Cache for Caches {
 
     /// get object by offset, from memory or tmp file
     fn get_by_offset(&self, offset: usize) -> Option<Arc<CacheObject>> {
+        // IMPORTANT: never hold a `map_offset` / `unbounded_offset_cache`
+        // DashMap shard read-guard across a `lru_cache` lock. `insert()` holds
+        // the `lru_cache` mutex across a `map_offset` write (lru -> shard), so
+        // taking the shard read-lock here and then locking `lru_cache`
+        // (shard -> lru) forms an ABBA lock-order inversion that deadlocks
+        // concurrent pack decoding. Copy the hash out and drop the shard
+        // read-guard BEFORE calling into `try_get` / `get_by_hash` (both of
+        // which lock `lru_cache`).
         if let Some(cache) = &self.unbounded_offset_cache {
-            return cache
-                .get(&offset)
-                .and_then(|obj| obj.base_object_hash())
-                .and_then(|hash| self.try_get(hash));
+            let hash = cache.get(&offset).and_then(|obj| obj.base_object_hash());
+            return hash.and_then(|hash| self.try_get(hash));
         }
 
-        match self.map_offset.get(&offset) {
-            Some(x) => self.get_by_hash(*x),
-            None => None,
-        }
+        let hash = self.map_offset.get(&offset).map(|x| *x);
+        hash.and_then(|hash| self.get_by_hash(hash))
     }
 
     /// get object by hash, from memory or tmp file
@@ -590,5 +605,117 @@ mod test {
         assert!(cache.hash_set.contains(&b_hash));
         assert!(!cache.resident_hash_set.contains(&a_hash));
         assert!(cache.resident_hash_set.contains(&b_hash));
+    }
+
+    /// Regression test for the ABBA lock-order inversion between the `lru_cache`
+    /// `Mutex` and the `map_offset` `DashMap` shard lock that deadlocked pack
+    /// decoding (git-internal <= 0.8.2).
+    ///
+    /// Two code paths acquired the two locks in opposite order:
+    ///   * `insert()` (bounded path): lock `lru_cache`, then — while still
+    ///     holding it — write `map_offset`  (order: lru -> shard).
+    ///   * `get_by_offset()`: hold the `map_offset` shard read-guard across
+    ///     `get_by_hash()`/`try_get()`, which lock `lru_cache` (order: shard -> lru).
+    ///
+    /// When a base `insert()` and a delta `get_by_offset()` hit the same
+    /// `DashMap` shard concurrently they wait on each other forever. This test
+    /// hammers both paths on a tiny offset space (so they collide on the same
+    /// shard) from many threads and fails via a watchdog timeout if they wedge.
+    /// It completes near-instantly once the inversion is fixed.
+    #[test]
+    fn test_cache_concurrent_insert_get_by_offset_no_deadlock() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let tmp = std::env::temp_dir().join(format!(
+            "gi_cache_abba_{}_{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        if tmp.exists() {
+            let _ = fs::remove_dir_all(&tmp);
+        }
+
+        // Bounded cache (mem_size = Some) exercises the buggy lru -> map_offset
+        // ordering in insert(). Sized large enough that every object stays
+        // resident, so get_by_offset() resolves via try_get() (which locks
+        // lru_cache) rather than the disk fallback — keeping the race tight and
+        // deterministic without depending on eviction.
+        let cache = Arc::new(Caches::new(Some(1 << 20), tmp.clone(), 8));
+
+        // A small offset space keeps writers and readers colliding on the same
+        // DashMap shards, which is what the inversion needs to wedge.
+        const OFFSETS: usize = 8;
+        const ITERS: usize = 20_000;
+        const WRITERS: usize = 6;
+        const READERS: usize = 6;
+
+        let hashes: Arc<Vec<ObjectHash>> = Arc::new(
+            (0..OFFSETS)
+                .map(|i| ObjectHash::new(format!("obj-{i}").as_bytes()))
+                .collect(),
+        );
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut handles = Vec::new();
+
+        for _ in 0..WRITERS {
+            let cache = cache.clone();
+            let hashes = hashes.clone();
+            let done_tx = done_tx.clone();
+            handles.push(thread::spawn(move || {
+                let _g = set_hash_kind_for_test(HashKind::Sha1);
+                for k in 0..ITERS {
+                    let o = k % OFFSETS;
+                    let obj = CacheObject {
+                        info: CacheObjectInfo::BaseObject(ObjectType::Blob, hashes[o]),
+                        data_decompressed: vec![0u8; 64],
+                        mem_recorder: None,
+                        offset: o,
+                        crc32: 0,
+                        is_delta_in_pack: false,
+                        known_hash: None,
+                    };
+                    cache.insert(o, hashes[o], obj);
+                }
+                let _ = done_tx.send(());
+            }));
+        }
+
+        for _ in 0..READERS {
+            let cache = cache.clone();
+            let done_tx = done_tx.clone();
+            handles.push(thread::spawn(move || {
+                let _g = set_hash_kind_for_test(HashKind::Sha1);
+                for k in 0..ITERS {
+                    let o = k % OFFSETS;
+                    let _ = cache.get_by_offset(o);
+                }
+                let _ = done_tx.send(());
+            }));
+        }
+        drop(done_tx);
+
+        // Watchdog: every worker must finish well within the timeout. On the
+        // pre-fix code the pool wedges (lru_cache <-> map_offset) and this times
+        // out; on fixed code all workers finish in well under a second.
+        let workers = WRITERS + READERS;
+        for finished in 0..workers {
+            if done_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .is_err()
+            {
+                panic!(
+                    "cache deadlock: only {finished}/{workers} workers finished within 30s — \
+                     the lru_cache <-> map_offset ABBA lock-order inversion has regressed"
+                );
+            }
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Drain the spill thread-pool before deleting the temp dir so in-flight
+        // f_save tasks don't race with cleanup.
+        cache.clear();
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
