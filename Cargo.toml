@@ -55,16 +55,16 @@ serde = { version = "1.0.228", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 uuid = { version = "1.23.4", features = ["serde", "v4", "v7"] }
 tokio = { version = "1.52.3", features = ["fs", "io-util"] }
-rkyv = { version = "0.8.16", features = ["bytecheck"] }
+rkyv = { version = "0.8.17", features = ["bytecheck"] }
 axum = { version = "0.8.9", features = ["macros", "json"] }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 quickcheck = "1.1.0"
-rand = "0.10.1"
+rand = "0.10.2"
 chacha20 = "0.10.1"
-ureq = "3"
+ureq = "3.3.0"
 
 [features]
 default = ["diff_rabin"]
