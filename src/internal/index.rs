@@ -3,6 +3,8 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::time::Duration;
 use std::{
     collections::BTreeMap,
     fmt::{Display, Formatter},
@@ -61,6 +63,44 @@ impl Display for Time {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.seconds, self.nanos)
     }
+}
+
+#[cfg(unix)]
+fn index_ctime(meta: &fs::Metadata) -> SystemTime {
+    unix_metadata_time(meta.ctime(), meta.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+fn index_ctime(meta: &fs::Metadata) -> SystemTime {
+    meta.created()
+        .or_else(|_| meta.modified())
+        .unwrap_or(UNIX_EPOCH)
+}
+
+#[cfg(unix)]
+fn index_mtime(meta: &fs::Metadata) -> SystemTime {
+    unix_metadata_time(meta.mtime(), meta.mtime_nsec())
+}
+
+#[cfg(not(unix))]
+fn index_mtime(meta: &fs::Metadata) -> SystemTime {
+    meta.modified()
+        .or_else(|_| meta.created())
+        .unwrap_or(UNIX_EPOCH)
+}
+
+#[cfg(unix)]
+fn unix_metadata_time(seconds: i64, nanos: i64) -> SystemTime {
+    if seconds < 0 {
+        return UNIX_EPOCH;
+    }
+
+    let nanos = u32::try_from(nanos)
+        .ok()
+        .filter(|nanos| *nanos < 1_000_000_000)
+        .unwrap_or(0);
+
+    UNIX_EPOCH + Duration::new(seconds as u64, nanos)
 }
 
 /// 16 bits
@@ -151,8 +191,8 @@ impl IndexEntry {
     /** Metadata must be got by [fs::symlink_metadata] to avoid following symlink */
     pub fn new(meta: &fs::Metadata, hash: ObjectHash, name: String) -> Self {
         let mut entry = IndexEntry {
-            ctime: Time::from_system_time(meta.created().unwrap()),
-            mtime: Time::from_system_time(meta.modified().unwrap()),
+            ctime: Time::from_system_time(index_ctime(meta)),
+            mtime: Time::from_system_time(index_mtime(meta)),
             dev: 0,
             ino: 0,
             uid: 0,
@@ -384,17 +424,8 @@ impl Index {
         if let Some(entry) = self.entries.get_mut(&(name.to_string(), 0)) {
             let abs_path = workdir.join(path);
             let meta = fs::symlink_metadata(&abs_path)?;
-            // Try creation time; on error, warn and use modification time (or now)
-            let new_ctime = Time::from_system_time(Self::time_or_now(
-                "creation time",
-                &abs_path,
-                meta.created(),
-            ));
-            let new_mtime = Time::from_system_time(Self::time_or_now(
-                "modification time",
-                &abs_path,
-                meta.modified(),
-            ));
+            let new_ctime = Time::from_system_time(index_ctime(&meta));
+            let new_mtime = Time::from_system_time(index_mtime(&meta));
             let new_size = meta.len() as u32;
 
             // re-calculate SHA1/SHA256
@@ -417,21 +448,6 @@ impl Index {
             }
         }
         Ok(false)
-    }
-
-    /// Try to get a timestamp, logging on error, and finally falling back to now.
-    fn time_or_now(what: &str, path: &Path, res: io::Result<SystemTime>) -> SystemTime {
-        match res {
-            Ok(ts) => ts,
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to get {what} for {path:?}: {e}; using SystemTime::now()",
-                    what = what,
-                    path = path.display()
-                );
-                SystemTime::now()
-            }
-        }
     }
 }
 
@@ -491,10 +507,8 @@ impl Index {
             let path_abs = workdir.join(file);
             let meta = path_abs.symlink_metadata().unwrap();
             // TODO more fields
-            let same = entry.ctime
-                == Time::from_system_time(meta.created().unwrap_or(SystemTime::now()))
-                && entry.mtime
-                    == Time::from_system_time(meta.modified().unwrap_or(SystemTime::now()))
+            let same = entry.ctime == Time::from_system_time(index_ctime(&meta))
+                && entry.mtime == Time::from_system_time(index_mtime(&meta))
                 && entry.size == meta.len() as u32;
 
             !same
