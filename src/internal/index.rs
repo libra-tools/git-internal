@@ -383,7 +383,7 @@ impl Index {
         file.write_all(&header)?;
         hash.update(&header);
 
-        for (_, entry) in self.entries.iter() {
+        for entry in self.entries.values() {
             let mut entry_bytes = Vec::new();
             entry_bytes.write_u32::<BigEndian>(entry.ctime.seconds)?;
             entry_bytes.write_u32::<BigEndian>(entry.ctime.nanos)?;
@@ -607,7 +607,7 @@ mod tests {
 
         let index = Index::from_file(source).unwrap();
         assert_eq!(index.size(), 760);
-        for (_, entry) in index.entries.iter() {
+        for entry in index.entries.values() {
             println!("{entry}");
         }
     }
@@ -621,7 +621,7 @@ mod tests {
 
         let index = Index::from_file(source).unwrap();
         assert_eq!(index.size(), 9);
-        for (_, entry) in index.entries.iter() {
+        for entry in index.entries.values() {
             println!("{entry}");
         }
     }

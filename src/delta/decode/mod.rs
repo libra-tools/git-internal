@@ -71,10 +71,7 @@ pub fn delta_decode(
                 GitDeltaError::DeltaDecoderError("Invalid copy instruction".to_string())
             });
 
-            match base_data {
-                Ok(data) => buffer.extend_from_slice(data),
-                Err(e) => return Err(e),
-            }
+            buffer.extend_from_slice(base_data?);
         }
     }
     assert!(buffer.len() == result_size);
