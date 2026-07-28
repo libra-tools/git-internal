@@ -21,7 +21,7 @@ pub fn read_size_encoding<R: Read>(stream: &mut R) -> std::io::Result<usize> {
     let mut length = 0;
 
     loop {
-        let (byte_value, more_bytes) = read_var_int_byte(stream).unwrap();
+        let (byte_value, more_bytes) = read_var_int_byte(stream)?;
         value |= (byte_value as usize) << length;
         if !more_bytes {
             return Ok(value);
