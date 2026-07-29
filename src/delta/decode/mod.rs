@@ -32,7 +32,7 @@ pub fn delta_decode(
 
     let result_size =
         utils::read_size_encoding(&mut stream).map_err(|err| decoder_error(err.to_string()))?;
-    let mut buffer = Vec::with_capacity(result_size);
+    let mut buffer = Vec::new();
     loop {
         // Check if the stream has ended, meaning the new object is done
         let instruction = match utils::read_bytes(stream) {
@@ -55,6 +55,7 @@ pub fn delta_decode(
             stream
                 .read_exact(&mut data)
                 .map_err(|err| decoder_error(err.to_string()))?;
+            prepare_result_append(&mut buffer, data.len(), result_size)?;
             buffer.extend_from_slice(&data);
         // result.extend_from_slice(&data);
         } else {
@@ -78,7 +79,9 @@ pub fn delta_decode(
                 .get(offset..end)
                 .ok_or_else(|| decoder_error("Invalid copy instruction"));
 
-            buffer.extend_from_slice(base_data?);
+            let base_data = base_data?;
+            prepare_result_append(&mut buffer, base_data.len(), result_size)?;
+            buffer.extend_from_slice(base_data);
         }
     }
     if buffer.len() != result_size {
@@ -88,6 +91,26 @@ pub fn delta_decode(
         )));
     }
     Ok(buffer)
+}
+
+fn prepare_result_append(
+    buffer: &mut Vec<u8>,
+    instruction_size: usize,
+    result_size: usize,
+) -> Result<(), GitDeltaError> {
+    let new_size = buffer
+        .len()
+        .checked_add(instruction_size)
+        .ok_or_else(|| decoder_error("result object size overflow"))?;
+    if new_size > result_size {
+        return Err(decoder_error(format!(
+            "result object exceeds declared size: expected {result_size}, got at least {new_size}"
+        )));
+    }
+    buffer
+        .try_reserve_exact(instruction_size)
+        .map_err(|err| decoder_error(format!("cannot allocate result object: {err}")))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -158,6 +181,51 @@ mod tests {
     #[test]
     fn result_size_mismatch_returns_error() {
         let mut cursor = Cursor::new(vec![0, 1]);
+        let err = delta_decode(&mut cursor, b"").unwrap_err();
+        assert!(matches!(err, GitDeltaError::DeltaDecoderError(_)));
+    }
+
+    /// Size varints wider than usize should be rejected instead of overflowing a shift.
+    #[test]
+    fn overlong_size_varint_returns_error() {
+        let mut bytes = vec![0x80; 10];
+        bytes.push(0);
+        let mut cursor = Cursor::new(bytes);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            delta_decode(&mut cursor, b"")
+        }));
+
+        assert!(result.is_ok(), "overlong size varint should not panic");
+        assert!(matches!(
+            result.unwrap(),
+            Err(GitDeltaError::DeltaDecoderError(_))
+        ));
+    }
+
+    /// An unallocatable declared result size should be rejected without reserving it eagerly.
+    #[test]
+    fn unallocatable_result_size_returns_error() {
+        let mut bytes = vec![0];
+        bytes.extend([0xff; 9]);
+        bytes.push(1);
+        let mut cursor = Cursor::new(bytes);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            delta_decode(&mut cursor, b"")
+        }));
+
+        assert!(result.is_ok(), "unallocatable result size should not panic");
+        assert!(matches!(
+            result.unwrap(),
+            Err(GitDeltaError::DeltaDecoderError(_))
+        ));
+    }
+
+    /// Instructions may not produce more bytes than the declared result size.
+    #[test]
+    fn instruction_exceeding_result_size_returns_error() {
+        let mut cursor = Cursor::new(vec![0, 1, 2, b'a', b'b']);
         let err = delta_decode(&mut cursor, b"").unwrap_err();
         assert!(matches!(err, GitDeltaError::DeltaDecoderError(_)));
     }

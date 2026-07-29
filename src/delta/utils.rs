@@ -1,7 +1,7 @@
 //! Shared readers for Git delta streams: length parsing, partial integer decoding, and VarInt helpers
 //! that both encoder and decoder reuse.
 
-use std::io::Read;
+use std::io::{self, Read};
 
 const VAR_INT_ENCODING_BITS: u8 = 7;
 const VAR_INT_CONTINUE_FLAG: u8 = 1 << VAR_INT_ENCODING_BITS;
@@ -22,12 +22,21 @@ pub fn read_size_encoding<R: Read>(stream: &mut R) -> std::io::Result<usize> {
 
     loop {
         let (byte_value, more_bytes) = read_var_int_byte(stream)?;
+        if length >= usize::BITS
+            || (length + u32::from(VAR_INT_ENCODING_BITS) > usize::BITS
+                && (byte_value as usize) > (usize::MAX >> length))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "delta size varint exceeds usize",
+            ));
+        }
         value |= (byte_value as usize) << length;
         if !more_bytes {
             return Ok(value);
         }
 
-        length += VAR_INT_ENCODING_BITS;
+        length += u32::from(VAR_INT_ENCODING_BITS);
     }
 }
 
