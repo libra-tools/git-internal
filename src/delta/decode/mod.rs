@@ -66,15 +66,10 @@ pub fn delta_decode(
                 // Copying 0 bytes doesn't make sense, so git assumes a different size
                 size = COPY_ZERO_SIZE;
             }
-            // Copy bytes from the base object
-            let base_data = base_info.get(offset..(offset + size)).ok_or_else(|| {
+            let data = base_info.get(offset..(offset + size)).ok_or_else(|| {
                 GitDeltaError::DeltaDecoderError("Invalid copy instruction".to_string())
-            });
-
-            match base_data {
-                Ok(data) => buffer.extend_from_slice(data),
-                Err(e) => return Err(e),
-            }
+            })?;
+            buffer.extend_from_slice(data);
         }
     }
     assert!(buffer.len() == result_size);

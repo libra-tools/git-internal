@@ -1,6 +1,6 @@
 [package]
 name = "git-internal"
-version = "0.8.3"
+version = "0.8.6"
 edition = "2024"
 authors = ["Eli Ma <genedna@gmail.com>"]
 description = "High-performance Rust library for Git internal objects, Pack files, and AI-assisted development objects (Intent, Plan, Task, Run, Evidence, Decision) with delta compression, streaming I/O, and smart protocol support."
@@ -40,16 +40,13 @@ libc = "0.2.186"
 async-trait = "0.1.89"
 futures = "0.3.32"
 tokio-stream = "0.1.18"
-natord = "1.0.9"
 tempfile = "3.27.0"
 path-absolutize = "3.1.1"
 similar = "3.1.1"
 sha2 = "0.11.0"
 crc32fast = "1.5.0"
-ring = "0.17.14"
 serde_json = "1.0.150"
 zstd-sys = { version = "2.0.16", features = ["experimental"] }
-sea-orm = { version = "1.1.20", features = ["sqlx-sqlite"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
