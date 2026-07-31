@@ -1071,3 +1071,70 @@ fn test_multi_point_similar_no_match() {
 fn test_multi_point_similar_too_small() {
     assert!(!multi_point_similar(&[1u8, 2, 3], &[4u8, 5, 6]));
 }
+
+/// Regression: the pack trailer must be built from the checksum's own length,
+/// not from the thread-local `HashKind`. The encoder is constructed under
+/// SHA-256 and then driven on a fresh thread whose thread-local still holds
+/// the default SHA-1 kind — the previous `ObjectHash::from_bytes` call
+/// panicked there ("Invalid byte length: got 32, expected 20"), which
+/// surfaced as flaky SHA-256 pack failures in async runtimes that migrate
+/// tasks across worker threads.
+#[test]
+fn test_parallel_encode_trailer_ignores_thread_local_kind() {
+    use crate::hash::get_hash_kind;
+
+    let _guard = set_hash_kind_for_test(HashKind::Sha256);
+
+    let entries: Vec<Entry> = (0..8)
+        .map(|i| Entry::from(Blob::from_content(&format!("thread-local-kind-{i}"))))
+        .collect();
+    let (tx, mut rx) = mpsc::channel(16);
+    let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(16);
+    let mut encoder = PackEncoder::new(entries.len(), 0, tx);
+
+    std::thread::spawn(move || {
+        // A fresh thread never saw `set_hash_kind`, so it holds the default
+        // SHA-1 kind — the exact condition that used to panic on finalize.
+        assert_eq!(get_hash_kind(), HashKind::Sha1);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        rt.block_on(async move {
+            for entry in entries {
+                entry_tx
+                    .send(MetaAttached {
+                        inner: entry,
+                        meta: EntryMeta::new(),
+                    })
+                    .await
+                    .expect("send entry");
+            }
+            drop(entry_tx);
+
+            encoder
+                .parallel_encode(entry_rx)
+                .await
+                .expect("parallel encode must succeed off the origin thread");
+
+            let mut pack = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                pack.extend(chunk);
+            }
+            let trailer = encoder
+                .get_hash()
+                .expect("final hash must be recorded after encode");
+            assert!(
+                matches!(trailer, ObjectHash::Sha256(_)),
+                "trailer must stay SHA-256 regardless of the worker thread's kind"
+            );
+            assert_eq!(
+                &pack[pack.len() - 32..],
+                trailer.to_data().as_slice(),
+                "pack trailer bytes must be the 32-byte SHA-256 checksum"
+            );
+        });
+    })
+    .join()
+    .expect("encoder thread must not panic");
+}

@@ -13,6 +13,8 @@ mod encode;
 mod errors;
 mod utils;
 
+pub(crate) use decode::delta_decode;
+
 const SAMPLE_STEP: usize = 64;
 const MIN_DELTA_RATE: f64 = 0.5;
 

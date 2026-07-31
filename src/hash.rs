@@ -211,6 +211,33 @@ impl ObjectHash {
             }
         }
     }
+    /// Create `ObjectHash` from raw bytes, inferring the hash kind from the
+    /// byte length (20 → SHA-1, 32 → SHA-256).
+    ///
+    /// Unlike [`ObjectHash::from_bytes`], this does not consult the
+    /// thread-local [`HashKind`], so it is safe on threads where
+    /// [`set_hash_kind`] was never called. The pack encoder finalizes its
+    /// running checksum on whichever async worker thread happens to run the
+    /// task; the checksum bytes already carry the correct length, while the
+    /// worker's thread-local may still hold the default SHA-1 kind — the
+    /// mismatch used to panic with "Invalid byte length: got 32, expected 20".
+    pub fn from_bytes_infer_kind(bytes: &[u8]) -> Result<ObjectHash, String> {
+        match bytes.len() {
+            20 => {
+                let mut h = [0u8; 20];
+                h.copy_from_slice(bytes);
+                Ok(ObjectHash::Sha1(h))
+            }
+            32 => {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(bytes);
+                Ok(ObjectHash::Sha256(h))
+            }
+            other => Err(format!(
+                "Invalid byte length: got {other}, expected 20 (SHA-1) or 32 (SHA-256)"
+            )),
+        }
+    }
     /// Read hash bytes from a stream according to current hash size.
     pub fn from_stream(data: &mut impl io::Read) -> io::Result<ObjectHash> {
         match get_hash_kind() {

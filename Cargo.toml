@@ -9,7 +9,7 @@ categories = ["development-tools", "encoding", "parser-implementations"]
 documentation = "https://libra.tools/docs/internal"
 readme = "README.md"
 homepage = "https://libra.tools"
-repository = "https://github.com/web3infra-foundation/libra"
+repository = "https://github.com/libra-tools/git-internal"
 license = "MIT"
 exclude = ["tests", ".github", ".claude", ".devcontainer", "examples"]
 
@@ -17,7 +17,7 @@ exclude = ["tests", ".github", ".claude", ".devcontainer", "examples"]
 maintenance = { status = "actively-developed" }
 
 [dependencies]
-bstr = "1.12.3"
+bstr = "1.13.0"
 hex = "0.4.3"
 thiserror = "2.0.18"
 tracing = "0.1.44"
@@ -38,10 +38,10 @@ ahash = "0.8.12"
 diffs = "0.5.1"
 libc = "0.2.186"
 async-trait = "0.1.89"
-futures = "0.3.32"
+futures = "0.3.33"
 tokio-stream = "0.1.18"
 tempfile = "3.27.0"
-path-absolutize = "3.1.1"
+path-absolutize = "4.0.1"
 similar = "3.1.1"
 sha2 = "0.11.0"
 crc32fast = "1.5.0"
@@ -50,8 +50,8 @@ zstd-sys = { version = "2.0.16", features = ["experimental"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
-uuid = { version = "1.23.4", features = ["serde", "v4", "v7"] }
-tokio = { version = "1.52.3", features = ["fs", "io-util"] }
+uuid = { version = "1.24.0", features = ["serde", "v4", "v7"] }
+tokio = { version = "1.53.0", features = ["fs", "io-util"] }
 rkyv = { version = "0.8.17", features = ["bytecheck"] }
 axum = { version = "0.8.9", features = ["macros", "json"] }
 

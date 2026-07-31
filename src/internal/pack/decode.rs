@@ -7,10 +7,10 @@ use std::io::{Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::{
     fs::File,
-    io::{self, BufRead, Cursor, ErrorKind, Read, Write},
+    io::{self, BufRead, Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -137,6 +137,7 @@ struct SharedParams {
     pub callback: Option<DecodeCallback>,
     pub retention: Option<Arc<DecodeRetention>>,
     pub skip_unneeded_objects: bool,
+    pub error: Mutex<Option<GitError>>,
 }
 
 #[derive(Default)]
@@ -1813,6 +1814,7 @@ impl Pack {
             callback,
             retention: retention_mode.retention,
             skip_unneeded_objects: retention_mode.skip_unneeded_objects,
+            error: Mutex::new(None),
         });
         let mut reader = if verify_pack_stream_hash {
             Wrapper::new(pack)
@@ -1968,6 +1970,11 @@ impl Pack {
         }
 
         self.pool.join(); // wait for all threads to finish
+
+        if let Some(error) = shared_params.error.lock().unwrap().take() {
+            self.abort_decode();
+            return Err(error);
+        }
 
         // send pack id for metadata
         if let Some(pack_callback) = pack_id_callback {
@@ -2257,14 +2264,25 @@ impl Pack {
 
         shared_params.pool.clone().execute(move || {
             let known_hash = delta_obj.known_hash;
-            let mut new_obj = match delta_obj.info {
+            let new_obj = match delta_obj.info {
                 CacheObjectInfo::OffsetDelta(_, _) | CacheObjectInfo::HashDelta(_, _) => {
                     Pack::rebuild_delta_with_hash(delta_obj, base_obj, known_hash)
                 }
-                CacheObjectInfo::OffsetZstdelta(_, _) => {
-                    Pack::rebuild_zstdelta_with_hash(delta_obj, base_obj, known_hash)
-                }
+                CacheObjectInfo::OffsetZstdelta(_, _) => Ok(Pack::rebuild_zstdelta_with_hash(
+                    delta_obj, base_obj, known_hash,
+                )),
                 _ => unreachable!(),
+            };
+
+            let mut new_obj = match new_obj {
+                Ok(new_obj) => new_obj,
+                Err(error) => {
+                    let mut decode_error = shared_params.error.lock().unwrap();
+                    if decode_error.is_none() {
+                        *decode_error = Some(error);
+                    }
+                    return;
+                }
             };
 
             new_obj.set_mem_recorder(shared_params.cache_objs_mem_size.clone());
@@ -2371,7 +2389,10 @@ impl Pack {
 
     /// Reconstruct the Delta Object based on the "base object"
     /// and return the new object.
-    pub fn rebuild_delta(delta_obj: CacheObject, base_obj: Arc<CacheObject>) -> CacheObject {
+    pub fn rebuild_delta(
+        delta_obj: CacheObject,
+        base_obj: Arc<CacheObject>,
+    ) -> Result<CacheObject, GitError> {
         Self::rebuild_delta_with_hash(delta_obj, base_obj, None)
     }
 
@@ -2379,91 +2400,15 @@ impl Pack {
         delta_obj: CacheObject,
         base_obj: Arc<CacheObject>,
         known_hash: Option<ObjectHash>,
-    ) -> CacheObject {
-        const COPY_INSTRUCTION_FLAG: u8 = 1 << 7;
-        const COPY_OFFSET_BYTES: u8 = 4;
-        const COPY_SIZE_BYTES: u8 = 3;
-        const COPY_ZERO_SIZE: usize = 0x10000;
-
+    ) -> Result<CacheObject, GitError> {
         let mut stream = Cursor::new(delta_obj.data_decompressed.as_slice());
-
-        // Read the base object size
-        // (Size Encoding)
-        let (base_size, result_size) = utils::read_delta_object_size(&mut stream).unwrap();
-
-        // Get the base object data
-        let base_info = &base_obj.data_decompressed;
-        assert_eq!(base_info.len(), base_size, "Base object size mismatch");
-
-        let mut result = Vec::with_capacity(result_size);
-
-        loop {
-            // Check if the stream has ended, meaning the new object is done
-            let instruction = match utils::read_bytes(&mut stream) {
-                Ok([instruction]) => instruction,
-                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
-                Err(err) => {
-                    panic!(
-                        "{}",
-                        GitError::DeltaObjectError(format!("Wrong instruction in delta :{err}"))
-                    );
-                }
-            };
-
-            if instruction & COPY_INSTRUCTION_FLAG == 0 {
-                // Data instruction; the instruction byte specifies the number of data bytes
-                if instruction == 0 {
-                    // Appending 0 bytes doesn't make sense, so git disallows it
-                    panic!(
-                        "{}",
-                        GitError::DeltaObjectError(String::from("Invalid data instruction"))
-                    );
-                }
-
-                let start = stream.position() as usize;
-                let end = start + instruction as usize;
-                let delta_data = *stream.get_ref();
-                let data = delta_data.get(start..end).unwrap_or_else(|| {
-                    panic!(
-                        "{}",
-                        GitError::DeltaObjectError("Invalid data instruction".to_string())
-                    )
-                });
-                result.extend_from_slice(data);
-                stream.set_position(end as u64);
-            } else {
-                // Copy instruction
-                // +----------+---------+---------+---------+---------+-------+-------+-------+
-                // | 1xxxxxxx | offset1 | offset2 | offset3 | offset4 | size1 | size2 | size3 |
-                // +----------+---------+---------+---------+---------+-------+-------+-------+
-                let mut nonzero_bytes = instruction;
-                let offset =
-                    utils::read_partial_int(&mut stream, COPY_OFFSET_BYTES, &mut nonzero_bytes)
-                        .unwrap();
-                let mut size =
-                    utils::read_partial_int(&mut stream, COPY_SIZE_BYTES, &mut nonzero_bytes)
-                        .unwrap();
-                if size == 0 {
-                    // Copying 0 bytes doesn't make sense, so git assumes a different size
-                    size = COPY_ZERO_SIZE;
-                }
-                // Copy bytes from the base object
-                let base_data = base_info.get(offset..(offset + size)).ok_or_else(|| {
-                    GitError::DeltaObjectError("Invalid copy instruction".to_string())
-                });
-
-                match base_data {
-                    Ok(data) => result.extend_from_slice(data),
-                    Err(e) => panic!("{}", e),
-                }
-            }
-        }
-        assert_eq!(result_size, result.len(), "Result size mismatch");
+        let result = crate::delta::delta_decode(&mut stream, &base_obj.data_decompressed)
+            .map_err(|error| GitError::DeltaObjectError(error.to_string()))?;
 
         let hash = known_hash
             .unwrap_or_else(|| utils::calculate_object_hash(base_obj.object_type(), &result));
         // create new obj from `delta_obj` & `result` instead of modifying `delta_obj` for heap-size recording
-        CacheObject {
+        Ok(CacheObject {
             info: CacheObjectInfo::BaseObject(base_obj.object_type(), hash),
             offset: delta_obj.offset,
             crc32: delta_obj.crc32,
@@ -2471,7 +2416,7 @@ impl Pack {
             mem_recorder: None,
             is_delta_in_pack: delta_obj.is_delta_in_pack,
             known_hash: None,
-        } // Canonical form (Complete Object)
+        }) // Canonical form (Complete Object)
         // Memory recording will happen after this function returns. See `process_delta`
     }
     pub fn rebuild_zstdelta(delta_obj: CacheObject, base_obj: Arc<CacheObject>) -> CacheObject {
@@ -2816,6 +2761,7 @@ mod tests {
             callback: Some(callback),
             retention: Some(Arc::new(super::DecodeRetention::default())),
             skip_unneeded_objects: true,
+            error: Mutex::new(None),
         });
         let obj = CacheObject {
             info: CacheObjectInfo::BaseObject(ObjectType::Blob, hash),
@@ -3451,10 +3397,76 @@ mod tests {
             known_hash: None,
         };
 
-        let rebuilt = Pack::rebuild_delta(delta, base);
+        let rebuilt = Pack::rebuild_delta(delta, base).unwrap();
 
         assert_eq!(rebuilt.object_type(), ObjectType::Blob);
         assert_eq!(rebuilt.data_decompressed, b"hi there");
+    }
+
+    #[test]
+    fn test_rebuild_delta_malformed_stream_returns_error() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let base = Arc::new(CacheObject::new_for_undeltified(
+            ObjectType::Blob,
+            b"hello".to_vec(),
+            12,
+            0,
+        ));
+        let delta = CacheObject {
+            info: CacheObjectInfo::OffsetDelta(12, 0),
+            offset: 20,
+            crc32: 0,
+            data_decompressed: Vec::new(),
+            mem_recorder: None,
+            is_delta_in_pack: true,
+            known_hash: None,
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Pack::rebuild_delta(delta, base)
+        }));
+
+        assert!(result.is_ok(), "malformed delta should not panic");
+        let result = result.unwrap();
+        assert!(
+            matches!(result, Err(crate::errors::GitError::DeltaObjectError(_))),
+            "unexpected decode result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_pack_decode_malformed_delta_returns_error_without_panic() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let mut pack_data = Vec::new();
+        pack_data.extend_from_slice(b"PACK");
+        pack_data.extend_from_slice(&2u32.to_be_bytes());
+        pack_data.extend_from_slice(&2u32.to_be_bytes());
+
+        let base_offset = pack_data.len();
+        pack_data.push(0x31);
+        append_compressed(&mut pack_data, b"a");
+
+        let delta_offset = pack_data.len();
+        let delta_payload = vec![0x01, 0x02, b'b'];
+        pack_data.push(0x63);
+        pack_data.push((delta_offset - base_offset) as u8);
+        append_compressed(&mut pack_data, &delta_payload);
+
+        let trailer = Sha1::digest(&pack_data);
+        pack_data.extend_from_slice(&trailer);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut reader = Cursor::new(pack_data);
+            let mut pack = Pack::new(Some(1), None, None, true);
+            pack.decode(&mut reader, |_| {}, None::<fn(ObjectHash)>)
+        }));
+
+        assert!(result.is_ok(), "malformed pack delta should not panic");
+        let result = result.unwrap();
+        assert!(
+            matches!(result, Err(crate::errors::GitError::DeltaObjectError(_))),
+            "unexpected decode result: {result:?}"
+        );
     }
 
     #[test]
