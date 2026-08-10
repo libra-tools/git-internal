@@ -61,8 +61,10 @@ fn parse_idx_offsets(idx_bytes: &[u8], kind: HashKind) -> HashMap<Vec<u8>, u64> 
     cursor = offsets_end;
 
     let large_count = offsets_bytes
-        .chunks_exact(4)
-        .filter(|raw| u32::from_be_bytes((*raw).try_into().unwrap()) & 0x8000_0000 != 0)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|raw| u32::from_be_bytes(**raw) & 0x8000_0000 != 0)
         .count();
 
     let mut large_offsets = Vec::with_capacity(large_count);
@@ -73,8 +75,8 @@ fn parse_idx_offsets(idx_bytes: &[u8], kind: HashKind) -> HashMap<Vec<u8>, u64> 
     }
 
     let mut map = HashMap::new();
-    for (i, raw) in offsets_bytes.chunks_exact(4).enumerate() {
-        let raw = u32::from_be_bytes(raw.try_into().unwrap());
+    for (i, raw) in offsets_bytes.as_chunks::<4>().0.iter().enumerate() {
+        let raw = u32::from_be_bytes(*raw);
         let offset = if raw & 0x8000_0000 == 0 {
             raw as u64
         } else {
