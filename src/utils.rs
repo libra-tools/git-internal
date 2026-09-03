@@ -1,5 +1,6 @@
-//! Shared I/O utilities for Git-internal including buffered readers, SHA abstractions, and helpers
-//! for reading pack/file bytes while tracking stream progress.
+//! Shared I/O utilities for Git-internal including buffered readers, the streaming hash
+//! abstraction over SHA-1 / SHA-256 / BLAKE3-256, and helpers for reading pack/file bytes while
+//! tracking stream progress.
 
 use std::{
     io,
@@ -87,7 +88,9 @@ impl<R: BufRead> BufRead for CountingReader<R> {
 pub enum HashAlgorithm {
     Sha1(Sha1),
     Sha256(sha2::Sha256),
-    // Future: support other hash algorithms
+    /// BLAKE3-256 (git-internal / Libra extension; 32-byte output). Boxed because the
+    /// BLAKE3 hasher state is much larger than the SHA states.
+    Blake3(Box<blake3::Hasher>),
 }
 impl HashAlgorithm {
     /// Create a new streaming hasher for an explicit `kind`.
@@ -99,6 +102,7 @@ impl HashAlgorithm {
         match kind {
             HashKind::Sha1 => HashAlgorithm::Sha1(Sha1::new()),
             HashKind::Sha256 => HashAlgorithm::Sha256(sha2::Sha256::new()),
+            HashKind::Blake3 => HashAlgorithm::Blake3(Box::new(blake3::Hasher::new())),
         }
     }
     /// Create a new hash algorithm instance based on the current thread-local hash kind.
@@ -112,6 +116,7 @@ impl HashAlgorithm {
         match self {
             HashAlgorithm::Sha1(_) => HashKind::Sha1,
             HashAlgorithm::Sha256(_) => HashKind::Sha256,
+            HashAlgorithm::Blake3(_) => HashKind::Blake3,
         }
     }
     /// Update hash with data
@@ -119,6 +124,9 @@ impl HashAlgorithm {
         match self {
             HashAlgorithm::Sha1(hasher) => hasher.update(data),
             HashAlgorithm::Sha256(hasher) => hasher.update(data),
+            HashAlgorithm::Blake3(hasher) => {
+                hasher.update(data);
+            }
         }
     }
     /// Finalize and get the raw digest bytes.
@@ -126,6 +134,7 @@ impl HashAlgorithm {
         match self {
             HashAlgorithm::Sha1(hasher) => hasher.finalize().to_vec(),
             HashAlgorithm::Sha256(hasher) => hasher.finalize().to_vec(),
+            HashAlgorithm::Blake3(hasher) => hasher.finalize().as_bytes().to_vec(),
         }
     }
     /// Finalize into an [`ObjectHash`] of the hasher's own kind.
@@ -138,6 +147,7 @@ impl HashAlgorithm {
         match self {
             HashAlgorithm::Sha1(hasher) => ObjectHash::Sha1(hasher.finalize().into()),
             HashAlgorithm::Sha256(hasher) => ObjectHash::Sha256(hasher.finalize().into()),
+            HashAlgorithm::Blake3(hasher) => ObjectHash::Blake3(*hasher.finalize().as_bytes()),
         }
     }
 }
@@ -205,7 +215,7 @@ mod tests {
     /// The parameterless constructors follow the thread-local kind (compatibility wrappers).
     #[test]
     fn hash_algorithm_for_kind_thread_local_wrappers() {
-        for kind in [HashKind::Sha1, HashKind::Sha256] {
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
             let _guard = set_hash_kind_for_test(kind);
             assert_eq!(HashAlgorithm::new().kind(), kind);
             assert_eq!(HashAlgorithm::default().kind(), kind);

@@ -315,9 +315,13 @@ mod tests {
         },
     };
 
-    const KINDS: [(HashKind, HashKind); 2] = [
+    /// (kind under test, "other" thread-local kind). The SHA-256/BLAKE3 pairs share the
+    /// same 32-byte width, so they prove the kind is carried as metadata, not inferred.
+    const KINDS: [(HashKind, HashKind); 4] = [
         (HashKind::Sha1, HashKind::Sha256),
         (HashKind::Sha256, HashKind::Sha1),
+        (HashKind::Blake3, HashKind::Sha256),
+        (HashKind::Sha256, HashKind::Blake3),
     ];
     const HELLO: &[u8] = b"Hello, world!";
     const HELLO_BLOB_SHA1: &str = "5dd01c177f5d7d1be5346a5bc18a569a7410c2ef";
@@ -543,13 +547,25 @@ mod tests {
         }
     }
 
-    /// Cross-kind references are rejected instead of being silently embedded.
+    /// Cross-kind references are rejected instead of being silently embedded — including the
+    /// same-width SHA-256/BLAKE3 pair.
     #[test]
     fn derived_id_for_kind_rejects_cross_kind_references() {
-        let _guard = set_hash_kind_for_test(HashKind::Sha1);
-        let sha1_blob = Blob::from_content_bytes_with_kind(HashKind::Sha1, HELLO.to_vec()).unwrap();
-        let sha256_blob =
-            Blob::from_content_bytes_with_kind(HashKind::Sha256, HELLO.to_vec()).unwrap();
+        for (own, foreign) in [
+            (HashKind::Sha1, HashKind::Sha256),
+            (HashKind::Sha256, HashKind::Blake3),
+            (HashKind::Blake3, HashKind::Sha256),
+        ] {
+            reject_cross_kind_references(own, foreign);
+        }
+    }
+
+    fn reject_cross_kind_references(own: HashKind, foreign: HashKind) {
+        let _guard = set_hash_kind_for_test(own);
+        let sha1_blob = Blob::from_content_bytes_with_kind(own, HELLO.to_vec()).unwrap();
+        let sha256_blob = Blob::from_content_bytes_with_kind(foreign, HELLO.to_vec()).unwrap();
+        assert_eq!(sha1_blob.id.kind(), own);
+        assert_eq!(sha256_blob.id.kind(), foreign);
 
         let is_kind_mismatch = |err: GitError| match err {
             GitError::InvalidHashValue(msg) => msg.contains("hash kind mismatch"),
@@ -558,10 +574,10 @@ mod tests {
 
         let item = TreeItem::new(TreeItemMode::Blob, sha256_blob.id, "x".to_string());
         assert!(is_kind_mismatch(
-            Tree::from_tree_items_with_kind(HashKind::Sha1, vec![item]).unwrap_err()
+            Tree::from_tree_items_with_kind(own, vec![item]).unwrap_err()
         ));
         let mut tree = Tree::from_tree_items_with_kind(
-            HashKind::Sha1,
+            own,
             vec![TreeItem::new(
                 TreeItemMode::Blob,
                 sha1_blob.id,
@@ -570,21 +586,18 @@ mod tests {
         )
         .unwrap();
         tree.tree_items[0].id = sha256_blob.id;
-        assert!(is_kind_mismatch(
-            tree.rehash_with_kind(HashKind::Sha1).unwrap_err()
-        ));
+        assert!(is_kind_mismatch(tree.rehash_with_kind(own).unwrap_err()));
 
         assert!(is_kind_mismatch(
-            Commit::from_tree_id_with_kind(HashKind::Sha1, sha256_blob.id, vec![], "m")
-                .unwrap_err()
+            Commit::from_tree_id_with_kind(own, sha256_blob.id, vec![], "m").unwrap_err()
         ));
         assert!(is_kind_mismatch(
-            Commit::from_tree_id_with_kind(HashKind::Sha1, sha1_blob.id, vec![sha256_blob.id], "m")
+            Commit::from_tree_id_with_kind(own, sha1_blob.id, vec![sha256_blob.id], "m")
                 .unwrap_err()
         ));
         assert!(is_kind_mismatch(
             Tag::new_with_kind(
-                HashKind::Sha1,
+                own,
                 sha256_blob.id,
                 ObjectType::Blob,
                 "t".to_string(),
@@ -594,7 +607,7 @@ mod tests {
             .unwrap_err()
         ));
         assert!(is_kind_mismatch(
-            Note::new_with_kind(HashKind::Sha1, sha256_blob.id, "n".to_string()).unwrap_err()
+            Note::new_with_kind(own, sha256_blob.id, "n".to_string()).unwrap_err()
         ));
     }
 

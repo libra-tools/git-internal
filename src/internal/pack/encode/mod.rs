@@ -404,14 +404,12 @@ impl PackEncoder {
         self.idx_entries = Some(idx_entries);
 
         // The checksum is both the pack trailer and the identifier used in pack-<hash>.pack.
-        // Infer the kind from the checksum length: this task may run on an async worker
-        // thread whose thread-local `HashKind` was never set, so `ObjectHash::from_bytes`
-        // could disagree with the hasher chosen at encoder construction.
-        let hash_result = self.inner_hash.clone().finalize();
-        self.final_hash = Some(
-            ObjectHash::from_bytes_infer_kind(&hash_result).map_err(GitError::PackEncodeError)?,
-        );
-        self.send_data(hash_result).await;
+        // The checksum kind comes from the hasher chosen at encoder construction, never
+        // from the checksum length or the (possibly foreign) thread-local `HashKind` of the
+        // async worker that runs this task: a 32-byte digest may be SHA-256 or BLAKE3.
+        let final_hash = self.inner_hash.clone().finalize_object_hash();
+        self.final_hash = Some(final_hash);
+        self.send_data(final_hash.to_data()).await;
 
         self.drop_sender();
         Ok(())

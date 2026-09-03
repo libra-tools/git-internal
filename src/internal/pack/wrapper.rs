@@ -1,5 +1,5 @@
 //! Reader wrapper that tracks how many bytes of a pack have been consumed while keeping a running
-//! SHA-1/SHA-256 hash for trailer verification.
+//! hash (SHA-1, SHA-256 or BLAKE3-256, per the repository `HashKind`) for trailer verification.
 
 use std::io::{self, BufRead, Read};
 
@@ -7,7 +7,8 @@ use crate::{
     hash::{HashKind, ObjectHash, get_hash_kind},
     utils::HashAlgorithm,
 };
-/// [`Wrapper`] is a wrapper around a reader that also computes the SHA1/ SHA256 hash of the data read.
+/// [`Wrapper`] is a wrapper around a reader that also computes the running hash (of the
+/// repository [`HashKind`]) of the data read.
 ///
 /// It is designed to work with any reader that implements `BufRead`.
 ///
@@ -69,9 +70,10 @@ where
         self.bytes_read
     }
 
-    /// Returns the final SHA1/ SHA256 hash of the data read so far.
+    /// Returns the final hash of the data read so far, as an [`ObjectHash`] of the
+    /// wrapper's hash kind.
     ///
-    /// This is a clone of the internal hash state finalized into a SHA1/ SHA256 hash.
+    /// This is a clone of the internal hash state finalized into an [`ObjectHash`].
     pub fn final_hash(&self) -> ObjectHash {
         self.hash
             .clone()

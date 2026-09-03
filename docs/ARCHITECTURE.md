@@ -77,7 +77,7 @@ Client ─pkt-line─▶ SmartProtocol
 ```
 
 - Dual hash: `wire_hash_kind` for on-wire format, `local_hash_kind` follows current thread setting; `RepositoryAccess::object_hash_kind()` (default: the thread-local kind, overridable by the storage backend) is the repository's own format and is what the default `get_blob`/`get_commit`/`get_tree` accessors parse incoming hash strings against (`ObjectHash::from_hex_for_kind`, fail-closed on a width/kind mismatch).
-- The `object-format` capability is emitted from `HashKind::as_str()` and parsed with the single `HashKind` parser (exact lowercase match); unknown values are logged and ignored (BLAKE3 negotiation and fail-closed handling arrive with B3-06).
+- The `object-format` capability is emitted from `HashKind::as_str()` and parsed with the single `HashKind` parser (exact lowercase match); unknown values are logged and ignored; `object-format=blake3` is currently treated the same way and `git_info_refs` refuses to advertise a non-standard wire kind (`InvalidRequest`), so BLAKE3 cannot be negotiated until B3-06 replaces this guard with the explicit BLAKE3 negotiation contract and fail-closed mismatch handling.
 - Capabilities: see `protocol/types.rs::Capability` (side-band, ofs-delta, report-status, etc.).
 - More details: `docs/GIT_PROTOCOL_GUIDE.md`.
 
@@ -109,7 +109,9 @@ Client ─pkt-line─▶ SmartProtocol
 
 ## Hashing & Compatibility
 
-- Default SHA-1; switch to SHA-256 via `set_hash_kind` (usually configured once upstream for the whole flow).
+- Default SHA-1; switch to SHA-256 or BLAKE3-256 via `set_hash_kind` (usually configured once upstream for the whole flow).
+- Compatibility matrix: `Sha1` and `Sha256` are the standard Git object formats (loose objects, packs, idx, protocol interoperate with Git). `Blake3` is a git-internal / Libra extension and a separate object namespace — same 32-byte / 64-hex width as SHA-256 but a distinct `HashKind`/`ObjectHash` variant; no in-place conversion of existing repositories, no interoperability with unmodified Git, and no length-based inference (`from_str` / `from_bytes_infer_kind` never yield BLAKE3; use the explicit-kind API or `blake3:HEX` tags).
+- Repository `ObjectHash` versus AI `IntegrityHash`: `ObjectHash` follows the repository `HashKind` (SHA-1 / SHA-256 / BLAKE3); the AI objects' `IntegrityHash` (`internal/object/integrity.rs`) is always SHA-256 regardless of the repository kind, and application-level digests (manifests, policies, HMACs) do not change with it.
 - `ObjectHash::from_type_and_data` matches Git object header format `<type> <size>\0<data>`, used for pack/idx/signatures; `ObjectHash::from_type_and_data_for_kind` / `internal::pack::utils::calculate_object_hash_for_kind` are the explicit-kind, fail-closed variants.
 - Algorithm dispatch is centralised (GC-02): the `HashAlgorithm` methods in `utils.rs` (`new_for_kind`, `kind`, `update`, `finalize`, `finalize_object_hash`) and the `HashKind`/`ObjectHash` methods in `hash.rs` are the only places that match on the algorithm. Pack object hashing (`calculate_object_hash`), the pack stream `Wrapper` (`Wrapper::new_with_kind`) and the smart-protocol `object-format` capability delegate to them instead of keeping per-algorithm tables, so adding a hash kind touches `hash.rs`/`utils.rs` only.
 - Thread-local `HashKind` is a compatibility default for the single-repository workflow; worker threads, async tasks, caches and protocol callbacks that may serve another repository use the explicit-kind API.

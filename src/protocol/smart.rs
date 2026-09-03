@@ -43,7 +43,11 @@ where
     R: RepositoryAccess,
     A: AuthenticationService,
 {
-    /// Set the wire hash kind (sha1 or sha256)
+    /// Set the wire hash kind (sha1, sha256 or blake3) and the matching zero ID.
+    ///
+    /// Until B3-06, only standard Git formats are negotiable: `git_info_refs`
+    /// refuses a non-standard wire kind and `parse_capabilities` ignores
+    /// `object-format=blake3`.
     pub fn set_wire_hash_kind(&mut self, kind: HashKind) {
         self.wire_hash_kind = kind;
         self.zero_id = ObjectHash::zero_str(kind);
@@ -93,6 +97,15 @@ where
         &self,
         service_type: ServiceType,
     ) -> Result<BytesMut, ProtocolError> {
+        // Only standard Git formats are negotiable until B3-06 lands the BLAKE3 extension
+        // contract: fail closed before touching the repository instead of advertising a
+        // format this protocol layer cannot yet validate end-to-end.
+        if !self.wire_hash_kind.is_git_standard() {
+            return Err(ProtocolError::InvalidRequest(format!(
+                "object-format={} is not negotiable by this protocol version (BLAKE3 negotiation arrives with B3-06)",
+                self.wire_hash_kind.as_str()
+            )));
+        }
         let refs = self
             .repo_storage
             .get_repository_refs()
@@ -430,11 +443,16 @@ where
         for cap in cap_str.split_whitespace() {
             if let Some(fmt) = cap.strip_prefix("object-format=") {
                 // Single `HashKind` parser (GC-02); the wire value must be the exact
-                // lowercase name (GC-13), so a case-variant is treated as unknown.
+                // lowercase name (GC-13), so a case-variant is treated as unknown. Only
+                // standard Git formats are accepted here until B3-06 defines the BLAKE3
+                // negotiation contract; anything else keeps the pre-existing warn-and-ignore
+                // semantics (B3-06 turns this into a fail-closed error).
                 match fmt.parse::<HashKind>() {
-                    Ok(kind) if kind.as_str() == fmt => self.set_wire_hash_kind(kind),
+                    Ok(kind) if kind.as_str() == fmt && kind.is_git_standard() => {
+                        self.set_wire_hash_kind(kind)
+                    }
                     _ => {
-                        tracing::warn!("Unknown object-format capability: {}", fmt);
+                        tracing::warn!("Unknown or unsupported object-format capability: {}", fmt);
                     }
                 }
                 continue;
@@ -756,12 +774,33 @@ mod tests {
         smart.parse_capabilities("object-format=md5");
         assert_eq!(smart.wire_hash_kind, HashKind::Sha1);
 
+        // BLAKE3 is a known kind but not negotiable before B3-06: ignored on parse,
+        // and info-refs refuses to advertise it.
+        smart.parse_capabilities("object-format=blake3");
+        assert_eq!(smart.wire_hash_kind, HashKind::Sha1);
+
         smart.parse_capabilities("object-format=sha256");
         assert_eq!(smart.wire_hash_kind, HashKind::Sha256);
         assert_eq!(smart.zero_id, ObjectHash::zero_str(HashKind::Sha256));
 
         smart.parse_capabilities("object-format=sha1");
         assert_eq!(smart.wire_hash_kind, HashKind::Sha1);
+    }
+
+    /// Until B3-06, a wire kind that is not a standard Git format cannot be advertised.
+    #[tokio::test]
+    async fn info_refs_rejects_non_git_standard_wire_kind_before_b3_06() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let mut smart =
+            SmartProtocol::new(TransportProtocol::Http, TestRepoAccess::new(), TestAuth);
+        smart.set_wire_hash_kind(HashKind::Blake3);
+        assert_eq!(smart.zero_id.len(), 64);
+        let err = smart
+            .git_info_refs(ServiceType::UploadPack)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProtocolError::InvalidRequest(_)), "{err:?}");
+        assert!(err.to_string().contains("blake3"), "{err}");
     }
 
     /// parse_capabilities should switch wire hash kind and record declared capabilities.

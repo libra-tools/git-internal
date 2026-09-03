@@ -1,4 +1,21 @@
-//! Hash utilities for Git objects with selectable algorithms (SHA-1 and SHA-256).
+//! Hash utilities for Git objects with selectable algorithms (SHA-1, SHA-256 and
+//! BLAKE3-256).
+//!
+//! # Algorithms
+//!
+//! * `Sha1` (20 bytes / 40 hex) and `Sha256` (32 bytes / 64 hex) follow the
+//!   standard Git object formats.
+//! * `Blake3` (32 bytes / 64 hex) is a **git-internal / Libra extension**: a
+//!   repository created with it is a separate object namespace that standard
+//!   Git does not understand. Because SHA-256 and BLAKE3 IDs have the same
+//!   width, a 64-hex or 32-byte value can only be interpreted inside a known
+//!   repository [`HashKind`] context (see the explicit-kind API below) or when
+//!   it carries its algorithm tag (`blake3:HEX`); nothing in this module guesses
+//!   BLAKE3 from a length.
+//! * BLAKE3 here is the *repository object ID* algorithm only. It does not
+//!   change [`crate::internal::object::integrity::IntegrityHash`] (always
+//!   SHA-256) or any application-level digest (Buck manifests, policy digests,
+//!   HMACs).
 //!
 //! # Thread-local default versus explicit `HashKind`
 //!
@@ -27,8 +44,8 @@
 //! the thread-local kind and must not be used where the repository format is
 //! known. When an ID has to travel across repositories, APIs, logs or indexes
 //! together with its algorithm, use the tagged representation
-//! (`sha1:HEX` / `sha256:HEX`) via [`ObjectHash::to_tagged_string`] and
-//! [`ObjectHash::from_tagged_str`].
+//! (`sha1:HEX` / `sha256:HEX` / `blake3:HEX`) via
+//! [`ObjectHash::to_tagged_string`] and [`ObjectHash::from_tagged_str`].
 //!
 //! Every explicit-kind parser fails closed: a length, hex or kind mismatch is
 //! reported through [`HashError`] (carrying the operation, the expected/actual
@@ -195,10 +212,13 @@ pub enum HashKind {
     #[default]
     Sha1,
     Sha256,
+    /// BLAKE3-256 repository object IDs (git-internal / Libra extension; not a
+    /// standard Git object format).
+    Blake3,
 }
 impl HashKind {
     /// Accepted lowercase tags for [`HashKind::from_str`] / tagged IDs, for diagnostics.
-    pub const ACCEPTED_TAGS: &'static str = "sha1|sha256";
+    pub const ACCEPTED_TAGS: &'static str = "sha1|sha256|blake3";
     /// Character lengths of [`HashKind::ACCEPTED_TAGS`], for diagnostics.
     pub const ACCEPTED_TAG_LENS: &'static str = "4|6";
 
@@ -207,21 +227,27 @@ impl HashKind {
         match self {
             HashKind::Sha1 => 20,
             HashKind::Sha256 => 32,
-            // Add more hash kinds here as needed
+            HashKind::Blake3 => 32,
         }
     }
     /// Hex string length of the hash output.
     pub const fn hex_len(&self) -> usize {
-        match self {
-            HashKind::Sha1 => 40,
-            HashKind::Sha256 => 64,
-        }
+        self.size() * 2
     }
-    /// Lowercase name of the hash algorithm.
+    /// Lowercase name of the hash algorithm (also the wire / tag spelling).
     pub const fn as_str(&self) -> &'static str {
         match self {
             HashKind::Sha1 => "sha1",
             HashKind::Sha256 => "sha256",
+            HashKind::Blake3 => "blake3",
+        }
+    }
+    /// Whether this kind is a standard Git object format (SHA-1, SHA-256) or a
+    /// git-internal / Libra extension (BLAKE3).
+    pub const fn is_git_standard(&self) -> bool {
+        match self {
+            HashKind::Sha1 | HashKind::Sha256 => true,
+            HashKind::Blake3 => false,
         }
     }
 }
@@ -237,6 +263,7 @@ impl std::str::FromStr for HashKind {
         match s.to_ascii_lowercase().as_str() {
             "sha1" => Ok(HashKind::Sha1),
             "sha256" => Ok(HashKind::Sha256),
+            "blake3" => Ok(HashKind::Blake3),
             _ => Err("Invalid hash kind".to_string()),
         }
     }
@@ -257,12 +284,19 @@ impl std::str::FromStr for HashKind {
     rkyv::Serialize,
     rkyv::Deserialize,
 )]
-/// Concrete object ID value carrying the bytes for the selected algorithm (SHA-1 or SHA-256).
+/// Concrete object ID value carrying the bytes for the selected algorithm
+/// (SHA-1, SHA-256 or BLAKE3-256).
 /// Used for Git object hashes.
 /// Supports conversion to/from hex strings, byte slices, and stream reading.
+///
+/// `Sha256` and `Blake3` carry the same 32 bytes and print as the same 64-hex
+/// width; they are distinct variants and never compare equal, so the algorithm
+/// is always preserved as metadata.
 pub enum ObjectHash {
     Sha1([u8; 20]),
     Sha256([u8; 32]),
+    /// BLAKE3-256 repository object ID (git-internal / Libra extension).
+    Blake3([u8; 32]),
 }
 impl Default for ObjectHash {
     fn default() -> Self {
@@ -279,6 +313,7 @@ impl AsRef<[u8]> for ObjectHash {
         match self {
             ObjectHash::Sha1(bytes) => bytes.as_slice(),
             ObjectHash::Sha256(bytes) => bytes.as_slice(),
+            ObjectHash::Blake3(bytes) => bytes.as_slice(),
         }
     }
 }
@@ -286,9 +321,11 @@ impl AsRef<[u8]> for ObjectHash {
 ///
 /// **Legacy, length-inferring parser.** The algorithm is chosen from the hex
 /// length alone (40 → SHA-1, 64 → SHA-256); the thread-local [`HashKind`] is
-/// *not* consulted. Any other length is rejected. When the repository format
-/// is known, prefer [`ObjectHash::from_hex_for_kind`]; when the ID travels with
-/// its algorithm, prefer [`ObjectHash::from_tagged_str`].
+/// *not* consulted and **BLAKE3 is never produced** (a BLAKE3 ID has the same
+/// 64-hex width and would be mislabelled as SHA-256). Any other length is
+/// rejected. When the repository format is known, prefer
+/// [`ObjectHash::from_hex_for_kind`]; when the ID travels with its algorithm,
+/// prefer [`ObjectHash::from_tagged_str`].
 impl FromStr for ObjectHash {
     type Err = String;
 
@@ -311,6 +348,7 @@ impl ObjectHash {
         match kind {
             HashKind::Sha1 => ObjectHash::Sha1([0u8; 20]),
             HashKind::Sha256 => ObjectHash::Sha256([0u8; 32]),
+            HashKind::Blake3 => ObjectHash::Blake3([0u8; 32]),
         }
     }
 
@@ -324,6 +362,7 @@ impl ObjectHash {
         match self {
             ObjectHash::Sha1(_) => HashKind::Sha1,
             ObjectHash::Sha256(_) => HashKind::Sha256,
+            ObjectHash::Blake3(_) => HashKind::Blake3,
         }
     }
     /// Return the hash size in bytes.
@@ -443,6 +482,11 @@ impl ObjectHash {
                 h.copy_from_slice(bytes);
                 ObjectHash::Sha256(h)
             }
+            HashKind::Blake3 => {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(bytes);
+                ObjectHash::Blake3(h)
+            }
         })
     }
 
@@ -527,7 +571,8 @@ impl ObjectHash {
     /// byte length (20 → SHA-1, 32 → SHA-256).
     ///
     /// **Legacy contract (frozen):** 20 bytes are always SHA-1 and 32 bytes are
-    /// always SHA-256. This helper predates the explicit-kind API and will be
+    /// always SHA-256 — **never BLAKE3**, even though BLAKE3 digests are also
+    /// 32 bytes. This helper predates the explicit-kind API and will be
     /// marked `#[deprecated]` once the remaining internal callers have moved to
     /// [`ObjectHash::from_bytes_for_kind`] / [`HashAlgorithm::finalize_object_hash`].
     /// It must not be used on any *new* repository, pack or protocol path,
@@ -639,6 +684,7 @@ impl ObjectHash {
         match self {
             ObjectHash::Sha1(bytes) => bytes.as_mut_slice(),
             ObjectHash::Sha256(bytes) => bytes.as_mut_slice(),
+            ObjectHash::Blake3(bytes) => bytes.as_mut_slice(),
         }
     }
 }
@@ -687,6 +733,7 @@ mod tests {
     use crate::{
         hash::{HashError, HashKind, ObjectHash, set_hash_kind_for_test},
         internal::{object::types::ObjectType, pack::test_pack_download::download_pack_file},
+        utils::HashAlgorithm,
     };
 
     /// Hashing "Hello, world!" with SHA1 should match known value.
@@ -1163,7 +1210,7 @@ mod tests {
         // Unknown / missing tags and tag-length mismatches fail closed.
         assert!(matches!(
             ObjectHash::from_tagged_str(&format!("md5:{HELLO_SHA1}")).unwrap_err(),
-            HashError::UnknownKind { tag, expected_tags: "sha1|sha256", actual: 3, hex_len: 40, .. } if tag == "md5"
+            HashError::UnknownKind { tag, expected_tags: "sha1|sha256|blake3", actual: 3, hex_len: 40, .. } if tag == "md5"
         ));
         assert!(matches!(
             ObjectHash::from_tagged_str(HELLO_SHA1).unwrap_err(),
@@ -1213,5 +1260,428 @@ mod tests {
             );
             assert!(ObjectHash::from_bytes_infer_kind(&[0u8; 16]).is_err());
         }
+    }
+
+    /// Official BLAKE3 test vectors (BLAKE3-team/BLAKE3 `test_vectors.json`, first 32 output
+    /// bytes): input byte `i` is `i % 251`.
+    const BLAKE3_VECTORS: &[(usize, &str)] = &[
+        (
+            0,
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        ),
+        (
+            1,
+            "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
+        ),
+        (
+            2,
+            "7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63",
+        ),
+        (
+            3,
+            "e1be4d7a8ab5560aa4199eea339849ba8e293d55ca0a81006726d184519e647f",
+        ),
+        (
+            4,
+            "f30f5ab28fe047904037f77b6da4fea1e27241c5d132638d8bedce9d40494f32",
+        ),
+        (
+            5,
+            "b40b44dfd97e7a84a996a91af8b85188c66c126940ba7aad2e7ae6b385402aa2",
+        ),
+        (
+            6,
+            "06c4e8ffb6872fad96f9aaca5eee1553eb62aed0ad7198cef42e87f6a616c844",
+        ),
+        (
+            7,
+            "3f8770f387faad08faa9d8414e9f449ac68e6ff0417f673f602a646a891419fe",
+        ),
+        (
+            8,
+            "2351207d04fc16ade43ccab08600939c7c1fa70a5c0aaca76063d04c3228eaeb",
+        ),
+        (
+            63,
+            "e9bc37a594daad83be9470df7f7b3798297c3d834ce80ba85d6e207627b7db7b",
+        ),
+        (
+            64,
+            "4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98",
+        ),
+        (
+            65,
+            "de1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c93a63f2d8d1c30ecb6b263dee",
+        ),
+        (
+            127,
+            "d81293fda863f008c09e92fc382a81f5a0b4a1251cba1634016a0f86a6bd640d",
+        ),
+        (
+            128,
+            "f17e570564b26578c33bb7f44643f539624b05df1a76c81f30acd548c44b45ef",
+        ),
+        (
+            129,
+            "683aaae9f3c5ba37eaaf072aed0f9e30bac0865137bae68b1fde4ca2aebdcb12",
+        ),
+        (
+            1023,
+            "10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11",
+        ),
+        (
+            1024,
+            "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7",
+        ),
+        (
+            1025,
+            "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444",
+        ),
+        (
+            2048,
+            "e776b6028c7cd22a4d0ba182a8bf62205d2ef576467e838ed6f2529b85fba24a",
+        ),
+        (
+            3072,
+            "b98cb0ff3623be03326b373de6b9095218513e64f1ee2edd2525c7ad1e5cffd2",
+        ),
+        (
+            4096,
+            "015094013f57a5277b59d8475c0501042c0b642e531b0a1c8f58d2163229e969",
+        ),
+        (
+            8192,
+            "aae792484c8efe4f19e2ca7d371d8c467ffb10748d8a5a1ae579948f718a2a63",
+        ),
+        (
+            31744,
+            "62b6960e1a44bcc1eb1a611a8d6235b6b4b78f32e7abc4fb4c6cdcce94895c47",
+        ),
+        (
+            102400,
+            "bc3e3d41a1146b069abffad3c0d44860cf664390afce4d9661f7902e7943e085",
+        ),
+    ];
+
+    /// BLAKE3 digests match the official vectors through every entry point (one-shot,
+    /// chunked streaming, `Write` sink) and the Git canonical header path is consistent.
+    #[test]
+    fn blake3_known_vectors() {
+        // Run under a SHA-1 thread-local to prove the explicit kind is what matters.
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        for &(len, expected) in BLAKE3_VECTORS {
+            let input: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+            let one_shot = ObjectHash::new_for_kind(HashKind::Blake3, &input);
+            assert_eq!(one_shot.kind(), HashKind::Blake3);
+            assert_eq!(one_shot.to_string(), expected, "len {len}");
+            assert_eq!(one_shot.size(), 32);
+
+            // Chunked streaming through HashAlgorithm must agree.
+            let mut hasher = HashAlgorithm::new_for_kind(HashKind::Blake3);
+            assert_eq!(hasher.kind(), HashKind::Blake3);
+            for chunk in input.chunks(97) {
+                hasher.update(chunk);
+            }
+            assert_eq!(hasher.finalize_object_hash(), one_shot, "len {len}");
+
+            let mut sink = HashAlgorithm::new_for_kind(HashKind::Blake3);
+            std::io::Write::write_all(&mut sink, &input).unwrap();
+            assert_eq!(hex::encode(sink.finalize()), expected, "len {len}");
+        }
+
+        // Git canonical header: hash("blob <size>\0" + data) via the crate directly.
+        let data = b"Hello, world!";
+        let object_id =
+            ObjectHash::from_type_and_data_for_kind(HashKind::Blake3, ObjectType::Blob, data)
+                .unwrap();
+        let mut reference = blake3::Hasher::new();
+        reference.update(b"blob 13\x00");
+        reference.update(data);
+        assert_eq!(
+            object_id,
+            ObjectHash::Blake3(*reference.finalize().as_bytes())
+        );
+        assert_eq!(object_id.to_string().len(), 64);
+        // Same payload, same width, different algorithm: never equal to SHA-256.
+        let sha256_id =
+            ObjectHash::from_type_and_data_for_kind(HashKind::Sha256, ObjectType::Blob, data)
+                .unwrap();
+        assert_eq!(sha256_id.size(), object_id.size());
+        assert_ne!(sha256_id, object_id);
+        assert_ne!(sha256_id.as_ref(), object_id.as_ref());
+        {
+            let _b3 = set_hash_kind_for_test(HashKind::Blake3);
+            assert_eq!(
+                ObjectHash::from_type_and_data(ObjectType::Blob, data),
+                object_id
+            );
+            assert_eq!(
+                ObjectHash::new(data),
+                ObjectHash::new_for_kind(HashKind::Blake3, data)
+            );
+            assert_eq!(HashAlgorithm::new().kind(), HashKind::Blake3);
+        }
+    }
+
+    /// BLAKE3 IDs are only produced under an explicit kind or a `blake3:` tag; a 64-hex /
+    /// 32-byte value is never guessed to be BLAKE3, and SHA-256/BLAKE3 never alias.
+    #[test]
+    fn blake3_context_and_tagged_id() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha256);
+        let digest = ObjectHash::new_for_kind(HashKind::Blake3, b"payload");
+        let hex_str = digest.to_string();
+        assert_eq!(hex_str.len(), 64);
+        assert_eq!(HashKind::Blake3.size(), 32);
+        assert_eq!(HashKind::Blake3.hex_len(), 64);
+        assert_eq!(HashKind::Blake3.as_str(), "blake3");
+        assert_eq!(HashKind::Blake3.to_string(), "blake3");
+        assert_eq!("blake3".parse::<HashKind>().unwrap(), HashKind::Blake3);
+        assert!(!HashKind::Blake3.is_git_standard());
+        assert!(HashKind::Sha1.is_git_standard() && HashKind::Sha256.is_git_standard());
+
+        // Explicit-kind parsers.
+        assert_eq!(
+            ObjectHash::from_hex_for_kind(HashKind::Blake3, &hex_str).unwrap(),
+            digest
+        );
+        assert_eq!(
+            ObjectHash::from_bytes_for_kind(HashKind::Blake3, digest.as_ref()).unwrap(),
+            digest
+        );
+        let mut cursor = std::io::Cursor::new(digest.to_data());
+        assert_eq!(
+            ObjectHash::from_stream_for_kind(HashKind::Blake3, &mut cursor).unwrap(),
+            digest
+        );
+        let zero = ObjectHash::zero_for_kind(HashKind::Blake3);
+        assert_eq!(zero, ObjectHash::Blake3([0u8; 32]));
+        assert_eq!(ObjectHash::zero_str(HashKind::Blake3), "0".repeat(64));
+        assert_ne!(zero, ObjectHash::zero_for_kind(HashKind::Sha256));
+
+        // Same hex under the SHA-256 kind is a *different* value (distinct variant).
+        let as_sha256 = ObjectHash::from_hex_for_kind(HashKind::Sha256, &hex_str).unwrap();
+        assert_ne!(as_sha256, digest);
+        assert_eq!(as_sha256.as_ref(), digest.as_ref());
+        assert_eq!(as_sha256.kind(), HashKind::Sha256);
+        assert_eq!(
+            digest.ensure_kind(HashKind::Sha256),
+            Err(HashError::KindMismatch {
+                operation: "ensure_kind",
+                expected: HashKind::Sha256,
+                actual: HashKind::Blake3,
+                expected_len: 32,
+                actual_len: 32,
+            })
+        );
+        assert!(
+            as_sha256
+                .ensure_kind(HashKind::Blake3)
+                .unwrap_err()
+                .to_string()
+                .contains("blake3")
+        );
+
+        // Tagged representation distinguishes the two 64-hex kinds.
+        assert_eq!(digest.to_tagged_string(), format!("blake3:{hex_str}"));
+        assert_eq!(as_sha256.to_tagged_string(), format!("sha256:{hex_str}"));
+        assert_eq!(
+            ObjectHash::from_tagged_str(&format!("blake3:{hex_str}")).unwrap(),
+            digest
+        );
+        assert_eq!(
+            ObjectHash::from_tagged_str(&format!("sha256:{hex_str}")).unwrap(),
+            as_sha256
+        );
+        assert!(matches!(
+            ObjectHash::from_tagged_str(&format!("blake3:{HELLO_SHA1}")).unwrap_err(),
+            HashError::InvalidLength {
+                kind: HashKind::Blake3,
+                expected: 64,
+                actual: 40,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ObjectHash::from_tagged_str(&format!("blake2:{hex_str}")).unwrap_err(),
+            HashError::UnknownKind {
+                expected_tags: "sha1|sha256|blake3",
+                ..
+            }
+        ));
+
+        // Legacy inference never yields BLAKE3, regardless of the thread-local kind.
+        for other in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let _tl = set_hash_kind_for_test(other);
+            assert_eq!(ObjectHash::from_str(&hex_str).unwrap(), as_sha256);
+            assert_eq!(
+                ObjectHash::from_str(&hex_str).unwrap().kind(),
+                HashKind::Sha256
+            );
+            assert_eq!(
+                ObjectHash::from_bytes_infer_kind(digest.as_ref())
+                    .unwrap()
+                    .kind(),
+                HashKind::Sha256
+            );
+        }
+        // Thread-local BLAKE3 drives the compatibility wrappers.
+        {
+            let _tl = set_hash_kind_for_test(HashKind::Blake3);
+            assert_eq!(ObjectHash::from_bytes(digest.as_ref()).unwrap(), digest);
+            let mut cursor = std::io::Cursor::new(digest.to_data());
+            assert_eq!(ObjectHash::from_stream(&mut cursor).unwrap(), digest);
+            assert_eq!(
+                ObjectHash::from_bytes(&[0u8; 20]).unwrap_err(),
+                "Invalid byte length: got 20, expected 32"
+            );
+        }
+
+        // serde: new variants round-trip and old SHA payloads still deserialize.
+        let json = serde_json::to_string(&digest).unwrap();
+        assert!(json.starts_with("{\"Blake3\":["), "{json}");
+        assert_eq!(serde_json::from_str::<ObjectHash>(&json).unwrap(), digest);
+        assert_eq!(
+            serde_json::to_string(&HashKind::Blake3).unwrap(),
+            "\"Blake3\""
+        );
+        assert_eq!(
+            serde_json::from_str::<HashKind>("\"Blake3\"").unwrap(),
+            HashKind::Blake3
+        );
+        let sha1 = ObjectHash::from_hex_for_kind(HashKind::Sha1, HELLO_SHA1).unwrap();
+        let legacy_json = format!(
+            "{{\"Sha1\":{}}}",
+            serde_json::to_string(&sha1.to_data()).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<ObjectHash>(&legacy_json).unwrap(),
+            sha1
+        );
+        let legacy_json = format!(
+            "{{\"Sha256\":{}}}",
+            serde_json::to_string(&as_sha256.to_data()).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<ObjectHash>(&legacy_json).unwrap(),
+            as_sha256
+        );
+        assert_eq!(
+            serde_json::from_str::<HashKind>("\"Sha256\"").unwrap(),
+            HashKind::Sha256
+        );
+
+        // Blake3 zero ID round-trips through serde and rkyv like any other value.
+        let zero_json = serde_json::to_string(&zero).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ObjectHash>(&zero_json).unwrap(),
+            zero
+        );
+        let zero_rkyv = rkyv::to_bytes::<rkyv::rancor::Error>(&zero).unwrap();
+        assert_eq!(
+            rkyv::from_bytes::<ObjectHash, rkyv::rancor::Error>(&zero_rkyv).unwrap(),
+            zero
+        );
+
+        // rkyv: archived round-trip for every kind.
+        for value in [sha1, as_sha256, digest, zero] {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&value).unwrap();
+            let back = rkyv::from_bytes::<ObjectHash, rkyv::rancor::Error>(&bytes).unwrap();
+            assert_eq!(back, value);
+        }
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&kind).unwrap();
+            assert_eq!(
+                rkyv::from_bytes::<HashKind, rkyv::rancor::Error>(&bytes).unwrap(),
+                kind
+            );
+        }
+    }
+
+    /// The AI IntegrityHash stays SHA-256 no matter which repository kind is active.
+    #[test]
+    fn blake3_does_not_change_integrity_hash() {
+        use crate::internal::object::integrity::IntegrityHash;
+        let content = b"integrity payload";
+        let expected = {
+            let _sha = set_hash_kind_for_test(HashKind::Sha256);
+            IntegrityHash::compute(content)
+        };
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let _tl = set_hash_kind_for_test(kind);
+            let got = IntegrityHash::compute(content);
+            assert_eq!(got, expected);
+            assert_eq!(got.to_hex().len(), 64);
+            assert_eq!(
+                got.as_bytes(),
+                ObjectHash::new_for_kind(HashKind::Sha256, content).as_ref()
+            );
+            assert_ne!(
+                got.as_bytes(),
+                ObjectHash::new_for_kind(HashKind::Blake3, content).as_ref()
+            );
+        }
+    }
+
+    /// Archives written by the pre-BLAKE3 crate (captured from the 0.8.7 baseline build)
+    /// still deserialize, and the new build emits byte-identical archives for SHA values:
+    /// the Blake3 variant is appended, so existing discriminants and layouts are unchanged.
+    #[test]
+    fn blake3_legacy_archives_still_deserialize() {
+        // rkyv bytes produced by git-internal 0.8.7 (before HashKind::Blake3 existed).
+        const LEGACY_RKYV_SHA1: &str =
+            "001111111111111111111111111111111111111111000000000000000000000000";
+        const LEGACY_RKYV_SHA256: &str =
+            "012222222222222222222222222222222222222222222222222222222222222222";
+        const LEGACY_RKYV_KIND_SHA1: &str = "00";
+        const LEGACY_RKYV_KIND_SHA256: &str = "01";
+        const LEGACY_JSON_SHA1: &str =
+            "{\"Sha1\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17]}";
+
+        let sha1 = ObjectHash::Sha1([0x11; 20]);
+        let sha256 = ObjectHash::Sha256([0x22; 32]);
+        let decode = |hex_bytes: &str| hex::decode(hex_bytes).unwrap();
+
+        assert_eq!(
+            rkyv::from_bytes::<ObjectHash, rkyv::rancor::Error>(&decode(LEGACY_RKYV_SHA1)).unwrap(),
+            sha1
+        );
+        assert_eq!(
+            rkyv::from_bytes::<ObjectHash, rkyv::rancor::Error>(&decode(LEGACY_RKYV_SHA256))
+                .unwrap(),
+            sha256
+        );
+        assert_eq!(
+            rkyv::from_bytes::<HashKind, rkyv::rancor::Error>(&decode(LEGACY_RKYV_KIND_SHA1))
+                .unwrap(),
+            HashKind::Sha1
+        );
+        assert_eq!(
+            rkyv::from_bytes::<HashKind, rkyv::rancor::Error>(&decode(LEGACY_RKYV_KIND_SHA256))
+                .unwrap(),
+            HashKind::Sha256
+        );
+        // Layout stability: the new crate writes the same bytes the old one did.
+        assert_eq!(
+            hex::encode(rkyv::to_bytes::<rkyv::rancor::Error>(&sha1).unwrap()),
+            LEGACY_RKYV_SHA1
+        );
+        assert_eq!(
+            hex::encode(rkyv::to_bytes::<rkyv::rancor::Error>(&sha256).unwrap()),
+            LEGACY_RKYV_SHA256
+        );
+        assert_eq!(
+            hex::encode(rkyv::to_bytes::<rkyv::rancor::Error>(&HashKind::Sha256).unwrap()),
+            LEGACY_RKYV_KIND_SHA256
+        );
+        assert_eq!(
+            serde_json::from_str::<ObjectHash>(LEGACY_JSON_SHA1).unwrap(),
+            sha1
+        );
+        assert_eq!(serde_json::to_string(&sha1).unwrap(), LEGACY_JSON_SHA1);
+        assert_eq!(
+            serde_json::from_str::<HashKind>("\"Sha256\"").unwrap(),
+            HashKind::Sha256
+        );
     }
 }
