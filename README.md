@@ -36,8 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `internal/index` / `internal/metadata`: .git/index IO, path/offset/CRC metadata.
 - `delta` / `zstdelta` / `diff.rs`: delta compression, zstd dictionary delta, line-level diff.
 - `internal/pack`: pack decode/encode, waitlist, cache, idx building.
-- `protocol/*`: smart protocol + HTTP/SSH adapters, wrapping info-refs/upload-pack/receive-pack.
-- Docs: [docs/ARCHITECTURE.md (architecture)](docs/ARCHITECTURE.md), [docs/GIT_OBJECTS.md (objects)](docs/GIT_OBJECTS.md), [docs/GIT_PROTOCOL_GUIDE.md (protocol)](docs/GIT_PROTOCOL_GUIDE.md), [docs/ai.md (AI objects)](docs/ai.md).
+- `protocol/*`: smart protocol + HTTP/SSH adapters, wrapping info-refs/upload-pack/receive-pack. `object-format=sha1|sha256` are the standard Git formats; `object-format=blake3` is a git-internal / Libra extension (not understood by unmodified Git), negotiated fail-closed against the repository's `object_hash_kind()`.
+- Docs: [docs/ARCHITECTURE.md (architecture)](docs/ARCHITECTURE.md), [docs/git-object.md (objects)](docs/git-object.md), [docs/git-protocol-guide.md (protocol)](docs/git-protocol-guide.md), [docs/agent.md (AI objects)](docs/agent.md).
 
 ## Key Features
 
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 3. Delta Compression Support
 
 - Offset Delta : References objects by pack file offset
-- Hash Delta : References objects by SHA-1 hash
+- Hash Delta : References objects by object ID (SHA-1 / SHA-256, or BLAKE3 as a git-internal extension)
 - Rabin fingerprint delta : Default pack encoding algorithm, selected by the default `diff_rabin` feature
 - Myers/Patience delta : Compatibility fallback when `diff_rabin` is disabled
 - Zstd Delta : Enhanced compression using Zstandard algorithm
@@ -113,7 +113,7 @@ A structured object graph that captures the full lifecycle of AI-assisted code c
 | **ContextSnapshot** | Static capture of files/URLs/snippets at Run start |
 | **ContextPipeline** | Dynamic sliding-window context accumulated during planning |
 
-All AI objects share a common `Header` (UUID, timestamps, creator) and are serialized as JSON. See [docs/ai.md](docs/ai.md) for the full lifecycle, field-level documentation, and usage examples.
+All AI objects share a common `Header` (UUID, timestamps, creator) and are serialized as JSON. See [docs/agent.md](docs/agent.md) for the full lifecycle, field-level documentation, and usage examples.
 
 ## Core Algorithms
 

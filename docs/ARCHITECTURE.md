@@ -76,10 +76,11 @@ Client ─pkt-line─▶ SmartProtocol
   └─ HTTP/SSH adapters: path/query parsing and auth delegation only
 ```
 
-- Dual hash: `wire_hash_kind` for on-wire format, `local_hash_kind` follows current thread setting; `RepositoryAccess::object_hash_kind()` (default: the thread-local kind, overridable by the storage backend) is the repository's own format and is what the default `get_blob`/`get_commit`/`get_tree` accessors parse incoming hash strings against (`ObjectHash::from_hex_for_kind`, fail-closed on a width/kind mismatch).
-- The `object-format` capability is emitted from `HashKind::as_str()` and parsed with the single `HashKind` parser (exact lowercase match); unknown values are logged and ignored; `object-format=blake3` is currently treated the same way and `git_info_refs` refuses to advertise a non-standard wire kind (`InvalidRequest`), so BLAKE3 cannot be negotiated until B3-06 replaces this guard with the explicit BLAKE3 negotiation contract and fail-closed mismatch handling.
+- Dual hash: `wire_hash_kind` for the on-wire format and `local_hash_kind` are both bound at `SmartProtocol::new` to `RepositoryAccess::object_hash_kind()` (not to the thread-local setting); `RepositoryAccess::object_hash_kind()` (default: the thread-local kind, overridable by the storage backend) is the repository's own format and is what the default `get_blob`/`get_commit`/`get_tree` accessors parse incoming hash strings against (`ObjectHash::from_hex_for_kind`, fail-closed on a width/kind mismatch).
+- Object-format negotiation (ADR-GI-B3-03): `SmartProtocol::new` binds `local_hash_kind`/`wire_hash_kind`/zero ID to `RepositoryAccess::object_hash_kind()`; info-refs advertises `object-format=<HashKind::as_str()>` and every operation (info-refs, upload-pack, receive-pack) first runs `ensure_hash_kind_consistency` (repository == local == wire, else `InvalidRequest`). `parse_capabilities` returns `Result`: the value goes through the single `HashKind` parser as an exact lowercase match, and an unknown/non-canonical value or a known value that differs from the repository is a fail-closed error (no warn-and-ignore, no SHA-1 fallback). want/have and receive-pack command IDs are parsed with `ObjectHash::from_hex_for_kind(wire kind)` as fixed-width raw lowercase hex — wrong width, tagged (`blake3:HEX`) or uppercase IDs are diagnosable errors (GC-13).
+- `object-format=sha1` / `object-format=sha256` are the standard Git values and interoperate with Git; `object-format=blake3` is a **git-internal / Libra extension**: a BLAKE3 repository advertises and accepts only `blake3`, an unmodified Git peer is not claimed to understand it, and BLAKE3 never rides on `sha256` (same ID width, different namespace). The protocol pack path (`PackGenerator`) is bound to one kind at construction (`SmartProtocol` hands over its validated kind; nothing is re-read after an `.await`), builds and decodes packs with it (`PackEncoder::new_with_hash_kind` / `Pack::new_with_hash_kind`), kind-checks every collected object and embedded reference, and delivers producer failures as `Err` stream items, so a pack of another format fails closed rather than being re-interpreted or truncated.
 - Capabilities: see `protocol/types.rs::Capability` (side-band, ofs-delta, report-status, etc.).
-- More details: `docs/GIT_PROTOCOL_GUIDE.md`.
+- More details: `docs/git-protocol-guide.md`.
 
 ## Typical Git Operations
 
@@ -120,6 +121,6 @@ Client ─pkt-line─▶ SmartProtocol
 ## References
 
 - README: quick start & performance tips.
-- docs/GIT_PROTOCOL_GUIDE.md: protocol details and layering.
-- docs/GIT_OBJECTS.md: Git objects overview.
+- docs/git-protocol-guide.md: protocol details and layering.
+- docs/git-object.md: Git objects overview.
 - tests/data/: committed `index/` and `objects/` fixtures; the pack fixtures under `tests/data/packs/` (`*.pack`/`*.idx`) are not committed — they are downloaded on demand by `download_pack_file` (`src/internal/pack/test_pack_download.rs`), so the full test suite needs network access (see the plan's GC-14).

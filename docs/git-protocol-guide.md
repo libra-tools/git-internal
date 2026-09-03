@@ -46,6 +46,7 @@ The git-internal library implements a transport layer abstraction for the Git sm
 
 - Complete Git smart protocol v1 implementation
 - Reference advertisement and capability negotiation
+- Object-format negotiation: `sha1` / `sha256` (standard Git) and `blake3` (git-internal / Libra extension, see 9.7)
 - upload-pack service (clone/fetch operations)
 - receive-pack service (push operations)
 - Pack file generation and parsing
@@ -149,7 +150,7 @@ Integrate any authentication system through AuthenticationService Trait:
 - InvalidService: Invalid service request
 - RepositoryNotFound: Repository does not exist
 - Unauthorized: Authentication failure
-- InvalidRequest: Request format error
+- InvalidRequest: Request format error — including `unknown object-format capability`, `object-format mismatch: wire=… local=… repository=…` and `invalid object ID in \`want\`/\`have\`/\`receive-pack …\` line` (see 9.7)
 - Other I/O and internal errors
 
 ### 8.2 Transport Mapping
@@ -292,6 +293,27 @@ S: end
 | Extensibility | Limited (capability list) | Open-ended (new commands possible) |
 | Efficiency | Moderate | High (fewer round trips, less data) |
 | Implementation Complexity | Medium | Higher but cleaner abstraction |
+
+### 9.7 Object Formats and the BLAKE3 Extension
+
+The `object-format` capability names the object-ID algorithm of the repository being served.
+
+| Value | Status | Interoperability |
+|---|---|---|
+| `sha1` | standard Git object format (default) | unmodified Git clients and servers |
+| `sha256` | standard Git object format | unmodified Git (`--object-format=sha256`) |
+| `blake3` | **git-internal / Libra extension** | git-internal / Libra peers only; unmodified Git does not understand it and no interoperability is claimed |
+
+Contract (ADR-GI-B3-03), enforced by `SmartProtocol`:
+
+- **Binding.** `SmartProtocol::new` reads `RepositoryAccess::object_hash_kind()` and binds `local_hash_kind`, `wire_hash_kind` and the zero ID (40 hex zeros for SHA-1, 64 for SHA-256 and BLAKE3) to it. Nothing is inferred from ID widths: SHA-256 and BLAKE3 share the 64-hex width but are distinct formats and never substitute for each other.
+- **Advertisement.** info-refs emits exactly ` object-format=<name>` for the repository's kind; a BLAKE3 repository advertises `object-format=blake3`.
+- **Negotiation (fail-closed).** `parse_capabilities` returns `Result<(), ProtocolError>`. The value must be the exact lowercase name known to `HashKind` (`sha1`, `sha256`, `blake3`); an unknown or non-canonical value is `InvalidRequest("unknown object-format capability …")`, and a known value that differs from the repository is `InvalidRequest("object-format mismatch: wire=… local=… repository=…")`. There is no warn-and-ignore and no fallback to SHA-1.
+- **Consistency check.** info-refs, upload-pack and receive-pack call `ensure_hash_kind_consistency` before touching refs, objects or pack bytes: repository kind, local kind and wire kind must agree.
+- **Wire IDs.** want/have lines and receive-pack commands (`<old-id> <new-id> <ref>`) are parsed with `ObjectHash::from_hex_for_kind(wire kind)`: fixed-width raw lowercase hex only. A wrong width (e.g. a 40-hex SHA-1 ID on a BLAKE3 wire), non-hex or uppercase characters, or a tagged ID such as `blake3:HEX` is `InvalidRequest("invalid object ID in \`want\` line …")`. Tagged IDs belong to APIs, indexes and logs, never to pkt-lines or pack payloads.
+- **Pack path.** `PackGenerator` is bound to one object format at construction (`SmartProtocol` passes its validated kind via `PackGenerator::new_with_hash_kind`; the kind is never re-read after an `.await`), encodes with `PackEncoder::new_with_hash_kind` and decodes with `Pack::new_with_hash_kind`; every collected object and every embedded reference (tree, parents, tree entries) must carry an ID of that kind, and a pack whose trailer or object IDs belong to another format fails closed. Pack bytes are streamed as `Result` items: a producer failure arrives as an `Err` item after any chunks already sent, and the consumer must treat the whole stream as failed.
+
+Compatibility: SHA-1 and SHA-256 advertisement, capability parsing and want/have/command handling are unchanged for well-formed input. A client that omits `object-format` is served under the repository's format: for a SHA-1 or SHA-256 repository that is standard Git behaviour, whereas a BLAKE3 repository can only be used by git-internal / Libra peers that understand BLAKE3 IDs — an unmodified Git client would misread its 64-hex IDs as SHA-256, so no such interoperability is claimed.
 
 ## 10. Integration Guide
 

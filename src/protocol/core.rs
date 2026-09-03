@@ -230,7 +230,11 @@ pub struct GitProtocol<R: RepositoryAccess, A: AuthenticationService> {
 }
 
 impl<R: RepositoryAccess, A: AuthenticationService> GitProtocol<R, A> {
-    /// Create a new GitProtocol instance
+    /// Create a new GitProtocol instance.
+    ///
+    /// The protocol is bound to `repo_access.object_hash_kind()`: info-refs advertises that
+    /// `object-format`, capability negotiation accepts only that value, and every operation
+    /// re-checks repository/local/wire kind consistency (see `SmartProtocol`).
     pub fn new(repo_access: R, auth_service: A) -> Self {
         Self {
             smart_protocol: SmartProtocol::new(
@@ -313,17 +317,25 @@ impl<R: RepositoryAccess, A: AuthenticationService> GitProtocol<R, A> {
             None
         };
 
+        // Producer failures travel as `Err` items and are forwarded as protocol errors, in
+        // both the side-band and the raw framing.
         let data_stream: ProtocolStream = if let Some(max_payload) = sideband_max {
             let stream = pack_stream.flat_map(move |chunk| {
-                let packets = build_side_band_packets(&chunk, max_payload);
-                futures::stream::iter(packets.into_iter().map(Ok))
+                let packets: Vec<Result<Bytes, ProtocolError>> = match chunk {
+                    Ok(chunk) => build_side_band_packets(&chunk, max_payload)
+                        .into_iter()
+                        .map(Ok)
+                        .collect(),
+                    Err(e) => vec![Err(e)],
+                };
+                futures::stream::iter(packets)
             });
             let stream = stream.chain(futures::stream::once(async {
                 Ok(Bytes::from_static(b"0000"))
             }));
             Box::pin(stream)
         } else {
-            Box::pin(pack_stream.map(|data| Ok(Bytes::from(data))))
+            Box::pin(pack_stream.map(|data| data.map(Bytes::from)))
         };
 
         Ok(Box::pin(ack_stream.chain(data_stream)))
@@ -785,5 +797,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `GitProtocol` follows the repository's `object_hash_kind()` end to end (BLAKE3 here,
+    /// while the thread-local kind stays SHA-1): info-refs advertises `object-format=blake3`
+    /// with a 64-hex zero ID, object access parses IDs as BLAKE3, upload-pack rejects a
+    /// SHA-1-width want line, and a repository whose kind diverges from the protocol's
+    /// binding is refused instead of served under another format.
+    #[tokio::test]
+    async fn hash_kind_context() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let blob = Blob::from_content_bytes_with_kind(HashKind::Blake3, b"hello".to_vec()).unwrap();
+        let repo = FixedKindRepo {
+            kind: HashKind::Blake3,
+            blob: blob.clone(),
+        };
+        let mut proto = GitProtocol::new(repo.clone(), MockAuth);
+
+        let bytes = proto.info_refs("git-upload-pack").await.unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(" object-format=blake3"), "{text}");
+        assert!(
+            text.contains(&format!("{} capabilities^{{}}", "0".repeat(64))),
+            "{text}"
+        );
+        assert!(!text.contains("object-format=sha"), "{text}");
+
+        // Object access uses the repository kind (64-hex BLAKE3 ID), not the thread-local one.
+        let fetched = repo.get_blob(&blob.id.to_string()).await.unwrap();
+        assert_eq!(fetched.id, blob.id);
+        assert_eq!(fetched.id.kind(), HashKind::Blake3);
+
+        // A SHA-1-width want line is a diagnosable error on the BLAKE3 wire.
+        let mut request = BytesMut::new();
+        crate::protocol::utils::add_pkt_line_string(
+            &mut request,
+            format!("want {}\n", "a".repeat(40)),
+        );
+        request.put(&crate::protocol::types::PKT_LINE_END_MARKER[..]);
+        let err = proto
+            .upload_pack(&request)
+            .await
+            .err()
+            .expect("SHA-1-width want on a BLAKE3 wire must fail");
+        assert!(matches!(err, ProtocolError::InvalidRequest(_)), "{err:?}");
+        assert!(err.to_string().contains("`want`"), "{err}");
+        assert!(err.to_string().contains("expected 64"), "{err}");
+
+        // A repository following the thread-local kind that changes after construction is
+        // refused (repository != local binding), never served as another format.
+        let dynamic = GitProtocol::new(MockRepo { refs: Vec::new() }, MockAuth);
+        {
+            let _inner = set_hash_kind_for_test(HashKind::Blake3);
+            let err = dynamic.info_refs("git-upload-pack").await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("wire=sha1 local=sha1 repository=blake3"),
+                "{err}"
+            );
+        }
+        assert!(dynamic.info_refs("git-upload-pack").await.is_ok());
     }
 }

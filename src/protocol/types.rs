@@ -6,6 +6,8 @@ use std::{fmt, pin::Pin, str::FromStr};
 use bytes::Bytes;
 use futures::stream::Stream;
 
+use crate::hash::HashKind;
+
 /// Type alias for protocol data streams to reduce nesting
 pub type ProtocolStream = Pin<Box<dyn Stream<Item = Result<Bytes, ProtocolError>> + Send>>;
 
@@ -48,6 +50,36 @@ impl ProtocolError {
 
     pub fn invalid_request(msg: &str) -> Self {
         ProtocolError::InvalidRequest(msg.to_string())
+    }
+
+    /// The peer's `object-format` capability value is unknown or not the canonical
+    /// lowercase name (`sha1`, `sha256`, or the git-internal / Libra extension `blake3`).
+    pub fn unknown_object_format(value: &str) -> Self {
+        let shown: String = value.chars().take(64).collect();
+        ProtocolError::InvalidRequest(format!(
+            "unknown object-format capability `{shown}` (accepted: {}); refusing to negotiate",
+            HashKind::ACCEPTED_TAGS
+        ))
+    }
+
+    /// The negotiated wire object format, the local kind bound at construction and the
+    /// repository's own `object_hash_kind()` do not agree (ADR-GI-B3-03).
+    pub fn object_format_mismatch(wire: HashKind, local: HashKind, repository: HashKind) -> Self {
+        ProtocolError::InvalidRequest(format!(
+            "object-format mismatch: wire={} local={} repository={}; refusing to serve the \
+             repository under another object format",
+            wire.as_str(),
+            local.as_str(),
+            repository.as_str()
+        ))
+    }
+
+    /// A pkt-line object ID is not raw lowercase hex of the negotiated wire kind (GC-13).
+    pub fn invalid_wire_id(command: &str, id: &str, detail: &dyn fmt::Display) -> Self {
+        let shown: String = id.chars().take(80).collect();
+        ProtocolError::InvalidRequest(format!(
+            "invalid object ID in `{command}` line (`{shown}`): {detail}"
+        ))
     }
 
     pub fn unauthorized(msg: &str) -> Self {
@@ -105,6 +137,9 @@ impl FromStr for ServiceType {
 /// - **Push control**: Atomic, DeleteRefs, Quiet - Atomic operations and reference management
 /// - **Tag handling**: IncludeTag - Automatic tag inclusion for upload-pack
 /// - **Client identification**: Agent - Client/server identification in capability negotiation
+/// - **Object format**: ObjectFormat - `object-format=<sha1|sha256|blake3>` negotiation
+///   (`blake3` is a git-internal / Libra extension); recorded after fail-closed validation
+///   against the repository's own format
 ///
 /// ### Not yet implemented capabilities:
 /// - **Basic protocol**: MultiAck - Basic multi-ack support (only detailed version implemented)
@@ -113,7 +148,7 @@ impl FromStr for ServiceType {
 /// - **Special fetch**: AllowTipSha1InWant, AllowReachableSha1InWant - SHA1 validation in want processing
 /// - **Security**: PushCert - Push certificate verification mechanism
 /// - **Extensions**: PushOptions, Filter, Symref - Extended parameter handling
-/// - **Session management**: SessionId, ObjectFormat - Session and format negotiation
+/// - **Session management**: SessionId - Session identification
 #[derive(Debug, Clone, PartialEq)]
 pub enum Capability {
     /// Multi-ack capability for upload-pack protocol
