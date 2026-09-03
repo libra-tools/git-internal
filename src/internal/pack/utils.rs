@@ -7,11 +7,10 @@ use std::{
     path::Path,
 };
 
-use sha1::{Digest, Sha1};
-
 use crate::{
-    hash::{ObjectHash, get_hash_kind},
+    hash::{HashError, HashKind, ObjectHash},
     internal::object::types::ObjectType,
+    utils::HashAlgorithm,
 };
 
 /// Checks if the reader has reached EOF (end of file).
@@ -277,44 +276,61 @@ fn decimal_usize_bytes(mut value: usize, buf: &mut [u8; 20]) -> &[u8] {
     &buf[cursor..]
 }
 
-/// Calculate the SHA1 hash of the given object.
+/// Stream `"<type> <size>\0<content>"` through `hasher` without allocating and
+/// finalize it into an [`ObjectHash`] of the hasher's own kind.
+fn hash_loose_object(mut hasher: HashAlgorithm, type_bytes: &[u8], data: &[u8]) -> ObjectHash {
+    let mut len_buf = [0; 20];
+    let len_bytes = decimal_usize_bytes(data.len(), &mut len_buf);
+    // Header: "<type> <size>\0"
+    hasher.update(type_bytes);
+    hasher.update(b" ");
+    hasher.update(len_bytes);
+    hasher.update(b"\0");
+    // Decompressed data(raw content)
+    hasher.update(data);
+    hasher.finalize_object_hash()
+}
+
+/// Calculate the object ID of the given object with an explicit repository `kind`.
 /// <br> "`<type> <size>\0<content>`"
 /// <br> data: The decompressed content of the object
+///
+/// Does not consult the thread-local [`HashKind`]. Delta types have no
+/// loose-object header and fail closed with [`HashError::UnsupportedObjectType`].
+pub fn calculate_object_hash_for_kind(
+    kind: HashKind,
+    obj_type: ObjectType,
+    data: &[u8],
+) -> Result<ObjectHash, HashError> {
+    let type_bytes = obj_type
+        .to_bytes()
+        .ok_or(HashError::UnsupportedObjectType {
+            operation: "calculate_object_hash_for_kind",
+            kind,
+            object_type: obj_type,
+            expected: kind.size(),
+            actual: 0,
+            payload_len: data.len(),
+        })?;
+    Ok(hash_loose_object(
+        HashAlgorithm::new_for_kind(kind),
+        type_bytes,
+        data,
+    ))
+}
+
+/// Calculate the object ID of the given object with the thread-local [`HashKind`]
+/// (SHA-1 or SHA-256).
+/// <br> "`<type> <size>\0<content>`"
+/// <br> data: The decompressed content of the object
+///
+/// Legacy entry point using the thread-local [`HashKind`] (digest dispatch now
+/// goes through [`HashAlgorithm`]); prefer [`calculate_object_hash_for_kind`].
 pub fn calculate_object_hash(obj_type: ObjectType, data: &[u8]) -> ObjectHash {
     let type_bytes = obj_type
         .to_bytes()
         .expect("calculate_object_hash called with a delta type that has no loose-object header");
-    let mut len_buf = [0; 20];
-    let len_bytes = decimal_usize_bytes(data.len(), &mut len_buf);
-    match get_hash_kind() {
-        crate::hash::HashKind::Sha1 => {
-            let mut hash = Sha1::new();
-            // Header: "<type> <size>\0"
-            hash.update(type_bytes);
-            hash.update(b" ");
-            hash.update(len_bytes);
-            hash.update(b"\0");
-
-            // Decompressed data(raw content)
-            hash.update(data);
-
-            let re: [u8; 20] = hash.finalize().into();
-            ObjectHash::Sha1(re)
-        }
-        crate::hash::HashKind::Sha256 => {
-            let mut hash = sha2::Sha256::new();
-            // Header: "<type> <size>\0"
-            hash.update(type_bytes);
-            hash.update(b" ");
-            hash.update(len_bytes);
-            hash.update(b"\0");
-
-            // Decompressed data(raw content)
-            hash.update(data);
-            let re: [u8; 32] = hash.finalize().into();
-            ObjectHash::Sha256(re)
-        }
-    }
+    hash_loose_object(HashAlgorithm::new(), type_bytes, data)
 }
 /// Create an empty directory or clear the existing directory.
 pub fn create_empty_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
@@ -581,5 +597,43 @@ mod tests {
         let result = read_offset_encoding(&mut cursor);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), (11013, 2));
+    }
+
+    /// `calculate_object_hash_for_kind` follows the explicit kind under the opposite
+    /// thread-local kind, agrees with `ObjectHash::from_type_and_data_for_kind`, and fails
+    /// closed for delta types; the legacy entry point follows the thread-local kind.
+    #[test]
+    fn calculate_object_hash_for_kind_ignores_thread_local() {
+        let data = b"hello pack";
+        for (kind, other) in [
+            (HashKind::Sha1, HashKind::Sha256),
+            (HashKind::Sha256, HashKind::Sha1),
+        ] {
+            let _guard = set_hash_kind_for_test(other);
+            let explicit = calculate_object_hash_for_kind(kind, ObjectType::Blob, data).unwrap();
+            assert_eq!(explicit.kind(), kind);
+            assert_eq!(
+                explicit,
+                ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Blob, data).unwrap()
+            );
+            assert_eq!(calculate_object_hash(ObjectType::Blob, data).kind(), other);
+            {
+                let _same = set_hash_kind_for_test(kind);
+                assert_eq!(calculate_object_hash(ObjectType::Blob, data), explicit);
+            }
+            let err =
+                calculate_object_hash_for_kind(kind, ObjectType::OffsetDelta, data).unwrap_err();
+            assert_eq!(
+                err,
+                HashError::UnsupportedObjectType {
+                    operation: "calculate_object_hash_for_kind",
+                    kind,
+                    object_type: ObjectType::OffsetDelta,
+                    expected: kind.size(),
+                    actual: 0,
+                    payload_len: data.len(),
+                }
+            );
+        }
     }
 }

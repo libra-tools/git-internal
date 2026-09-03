@@ -76,7 +76,8 @@ Client ─pkt-line─▶ SmartProtocol
   └─ HTTP/SSH adapters: path/query parsing and auth delegation only
 ```
 
-- Dual hash: `wire_hash_kind` for on-wire format, `local_hash_kind` follows current thread setting.
+- Dual hash: `wire_hash_kind` for on-wire format, `local_hash_kind` follows current thread setting; `RepositoryAccess::object_hash_kind()` (default: the thread-local kind, overridable by the storage backend) is the repository's own format and is what the default `get_blob`/`get_commit`/`get_tree` accessors parse incoming hash strings against (`ObjectHash::from_hex_for_kind`, fail-closed on a width/kind mismatch).
+- The `object-format` capability is emitted from `HashKind::as_str()` and parsed with the single `HashKind` parser (exact lowercase match); unknown values are logged and ignored (BLAKE3 negotiation and fail-closed handling arrive with B3-06).
 - Capabilities: see `protocol/types.rs::Capability` (side-band, ofs-delta, report-status, etc.).
 - More details: `docs/GIT_PROTOCOL_GUIDE.md`.
 
@@ -109,7 +110,9 @@ Client ─pkt-line─▶ SmartProtocol
 ## Hashing & Compatibility
 
 - Default SHA-1; switch to SHA-256 via `set_hash_kind` (usually configured once upstream for the whole flow).
-- `ObjectHash::from_type_and_data` matches Git object header format `<type> <size>\0<data>`, used for pack/idx/signatures.
+- `ObjectHash::from_type_and_data` matches Git object header format `<type> <size>\0<data>`, used for pack/idx/signatures; `ObjectHash::from_type_and_data_for_kind` / `internal::pack::utils::calculate_object_hash_for_kind` are the explicit-kind, fail-closed variants.
+- Algorithm dispatch is centralised (GC-02): the `HashAlgorithm` methods in `utils.rs` (`new_for_kind`, `kind`, `update`, `finalize`, `finalize_object_hash`) and the `HashKind`/`ObjectHash` methods in `hash.rs` are the only places that match on the algorithm. Pack object hashing (`calculate_object_hash`), the pack stream `Wrapper` (`Wrapper::new_with_kind`) and the smart-protocol `object-format` capability delegate to them instead of keeping per-algorithm tables, so adding a hash kind touches `hash.rs`/`utils.rs` only.
+- Thread-local `HashKind` is a compatibility default for the single-repository workflow; worker threads, async tasks, caches and protocol callbacks that may serve another repository use the explicit-kind API.
 - For tests, use `set_hash_kind_for_test` to temporarily switch hash algorithm; test isolation avoids cross-thread interference.
 
 ## References
@@ -117,4 +120,4 @@ Client ─pkt-line─▶ SmartProtocol
 - README: quick start & performance tips.
 - docs/GIT_PROTOCOL_GUIDE.md: protocol details and layering.
 - docs/GIT_OBJECTS.md: Git objects overview.
-- tests/data/: real pack/index fixtures for decode/idx roundtrip testing.
+- tests/data/: committed `index/` and `objects/` fixtures; the pack fixtures under `tests/data/packs/` (`*.pack`/`*.idx`) are not committed — they are downloaded on demand by `download_pack_file` (`src/internal/pack/test_pack_download.rs`), so the full test suite needs network access (see the plan's GC-14).

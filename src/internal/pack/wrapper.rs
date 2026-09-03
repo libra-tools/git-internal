@@ -3,8 +3,6 @@
 
 use std::io::{self, BufRead, Read};
 
-use sha1::{Digest, Sha1};
-
 use crate::{
     hash::{HashKind, ObjectHash, get_hash_kind},
     utils::HashAlgorithm,
@@ -28,19 +26,33 @@ impl<R> Wrapper<R>
 where
     R: BufRead,
 {
+    /// Constructs a new [`Wrapper`] with hash tracking enabled for an explicit
+    /// repository `kind`.
+    ///
+    /// Does not consult the thread-local [`HashKind`]; use this on worker
+    /// threads and async tasks that may serve another repository.
+    pub fn new_with_kind(inner: R, kind: HashKind) -> Self {
+        Self {
+            inner,
+            hash: Some(HashAlgorithm::new_for_kind(kind)),
+            bytes_read: 0,
+        }
+    }
+
     /// Constructs a new [`Wrapper`] with hash tracking enabled.
+    ///
+    /// Compatibility wrapper around [`Wrapper::new_with_kind`] using the
+    /// thread-local [`HashKind`].
     ///
     /// # Parameters
     /// * `inner`: The reader to wrap.
     pub fn new(inner: R) -> Self {
-        Self {
-            inner,
-            hash: Some(match get_hash_kind() {
-                HashKind::Sha1 => HashAlgorithm::Sha1(Sha1::new()),
-                HashKind::Sha256 => HashAlgorithm::Sha256(sha2::Sha256::new()),
-            }), // Initialize a new SHA1/ SHA256 hasher
-            bytes_read: 0,
-        }
+        Self::new_with_kind(inner, get_hash_kind())
+    }
+
+    /// The [`HashKind`] of the running hash, or `None` when hash tracking is disabled.
+    pub fn hash_kind(&self) -> Option<HashKind> {
+        self.hash.as_ref().map(HashAlgorithm::kind)
     }
 
     /// Constructs a wrapper that only tracks bytes read, skipping the running hash.
@@ -61,20 +73,10 @@ where
     ///
     /// This is a clone of the internal hash state finalized into a SHA1/ SHA256 hash.
     pub fn final_hash(&self) -> ObjectHash {
-        match &self
-            .hash
+        self.hash
             .clone()
             .expect("Wrapper::final_hash called while hash tracking is disabled")
-        {
-            HashAlgorithm::Sha1(hasher) => {
-                let re: [u8; 20] = hasher.clone().finalize().into(); // Clone, finalize, and convert the hash into bytes
-                ObjectHash::from_bytes(&re).unwrap()
-            }
-            HashAlgorithm::Sha256(hasher) => {
-                let re: [u8; 32] = hasher.clone().finalize().into(); // Clone, finalize, and convert the hash into bytes
-                ObjectHash::from_bytes(&re).unwrap()
-            }
-        }
+            .finalize_object_hash()
     }
 }
 
@@ -94,10 +96,7 @@ where
     fn consume(&mut self, amt: usize) {
         let buffer = self.inner.fill_buf().expect("Failed to fill buffer");
         if let Some(hash) = &mut self.hash {
-            match hash {
-                HashAlgorithm::Sha1(hasher) => hasher.update(&buffer[..amt]), // Update SHA1 hash with the data being consumed
-                HashAlgorithm::Sha256(hasher) => hasher.update(&buffer[..amt]), // Update SHA256 hash with the data being consumed
-            }
+            hash.update(&buffer[..amt]); // Update the running hash with the data being consumed
         }
         self.inner.consume(amt); // Consume the data from the inner reader
         self.bytes_read += amt;
@@ -119,10 +118,7 @@ where
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let o = self.inner.read(buf)?; // Read data into the buffer
         if let Some(hash) = &mut self.hash {
-            match hash {
-                HashAlgorithm::Sha1(hasher) => hasher.update(&buf[..o]), // Update SHA1 hash with the data being read
-                HashAlgorithm::Sha256(hasher) => hasher.update(&buf[..o]), // Update SHA256 hash with the data being read
-            }
+            hash.update(&buf[..o]); // Update the running hash with the data being read
         }
         self.bytes_read += o;
         Ok(o) // Return the number of bytes read
@@ -131,9 +127,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, BufReader, Cursor, Read};
-
-    use sha1::{Digest, Sha1};
+    use std::io::{self, BufRead, BufReader, Cursor, Read};
 
     use crate::{
         hash::{HashKind, ObjectHash, set_hash_kind_for_test},
@@ -173,12 +167,50 @@ mod tests {
         wrapper.read_exact(&mut buffer)?;
 
         let hash_result = wrapper.final_hash();
-        let expected_hash = match kind {
-            HashKind::Sha1 => ObjectHash::from_bytes(&Sha1::digest(data)).unwrap(),
-            HashKind::Sha256 => ObjectHash::from_bytes(&sha2::Sha256::digest(data)).unwrap(),
-        };
+        // Explicit-kind digest of the same bytes; no exhaustive `HashKind` match here so a
+        // future variant does not break this fixture.
+        let expected_hash = ObjectHash::new_for_kind(kind, data);
 
         assert_eq!(hash_result, expected_hash);
+        assert_eq!(wrapper.hash_kind(), Some(kind));
+        Ok(())
+    }
+
+    /// `new_with_kind` hashes for the explicit kind regardless of the thread-local kind,
+    /// through both `read` and `consume` paths.
+    #[test]
+    fn test_wrapper_new_with_kind_ignores_thread_local() -> io::Result<()> {
+        for (kind, other) in [
+            (HashKind::Sha1, HashKind::Sha256),
+            (HashKind::Sha256, HashKind::Sha1),
+        ] {
+            let _guard = set_hash_kind_for_test(other);
+            let data = b"Hello, world!";
+            let expected = ObjectHash::new_for_kind(kind, data);
+
+            let mut wrapper =
+                Wrapper::new_with_kind(BufReader::new(Cursor::new(data.as_ref())), kind);
+            let mut buffer = vec![0; data.len()];
+            wrapper.read_exact(&mut buffer)?;
+            assert_eq!(wrapper.hash_kind(), Some(kind));
+            assert_eq!(wrapper.final_hash(), expected);
+            assert_eq!(wrapper.bytes_read(), data.len());
+
+            let mut wrapper =
+                Wrapper::new_with_kind(BufReader::new(Cursor::new(data.as_ref())), kind);
+            let n = wrapper.fill_buf()?.len();
+            wrapper.consume(n);
+            assert_eq!(wrapper.final_hash(), expected);
+
+            assert_eq!(
+                Wrapper::new(BufReader::new(Cursor::new(data.as_ref()))).hash_kind(),
+                Some(other)
+            );
+            assert_eq!(
+                Wrapper::new_without_hash(BufReader::new(Cursor::new(data.as_ref()))).hash_kind(),
+                None
+            );
+        }
         Ok(())
     }
     #[test]

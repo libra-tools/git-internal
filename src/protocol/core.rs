@@ -2,14 +2,14 @@
 //!
 //! This module provides the main `GitProtocol` struct and `RepositoryAccess` trait
 //! that form the core interface of the git-internal library.
-use std::{collections::HashMap, str::FromStr};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::stream::StreamExt;
 
 use crate::{
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash, get_hash_kind},
     internal::object::ObjectTrait,
     protocol::{
         smart::SmartProtocol,
@@ -23,6 +23,18 @@ use crate::{
 /// The git-internal library handles all Git protocol formatting and parsing.
 #[async_trait]
 pub trait RepositoryAccess: Send + Sync + Clone {
+    /// The object-ID hash kind of this repository.
+    ///
+    /// The default returns the thread-local [`HashKind`] so existing
+    /// implementors keep working unchanged; implementors that serve a
+    /// repository whose format is known (or that may be called from a thread
+    /// configured for another repository) should override it to return the
+    /// repository's real format. The default object accessors below parse
+    /// incoming hash strings against this kind and fail closed on a mismatch.
+    fn object_hash_kind(&self) -> HashKind {
+        get_hash_kind()
+    }
+
     /// Get repository references as raw (name, hash) pairs
     async fn get_repository_refs(&self) -> Result<Vec<(String, String)>, ProtocolError>;
 
@@ -64,9 +76,15 @@ pub trait RepositoryAccess: Send + Sync + Clone {
         &self,
         object_hash: &str,
     ) -> Result<crate::internal::object::blob::Blob, ProtocolError> {
-        let data = self.get_object(object_hash).await?;
-        let hash = ObjectHash::from_str(object_hash)
+        // Resolve the repository kind before the first await: the default reads a
+
+        // thread-local, and the future may resume on another worker thread.
+
+        let kind = self.object_hash_kind();
+
+        let hash = ObjectHash::from_hex_for_kind(kind, object_hash)
             .map_err(|e| ProtocolError::repository_error(format!("Invalid hash format: {e}")))?;
+        let data = self.get_object(object_hash).await?;
 
         crate::internal::object::blob::Blob::from_bytes(&data, hash)
             .map_err(|e| ProtocolError::repository_error(format!("Failed to parse blob: {e}")))
@@ -80,9 +98,15 @@ pub trait RepositoryAccess: Send + Sync + Clone {
         &self,
         commit_hash: &str,
     ) -> Result<crate::internal::object::commit::Commit, ProtocolError> {
-        let data = self.get_object(commit_hash).await?;
-        let hash = ObjectHash::from_str(commit_hash)
+        // Resolve the repository kind before the first await: the default reads a
+
+        // thread-local, and the future may resume on another worker thread.
+
+        let kind = self.object_hash_kind();
+
+        let hash = ObjectHash::from_hex_for_kind(kind, commit_hash)
             .map_err(|e| ProtocolError::repository_error(format!("Invalid hash format: {e}")))?;
+        let data = self.get_object(commit_hash).await?;
 
         crate::internal::object::commit::Commit::from_bytes(&data, hash)
             .map_err(|e| ProtocolError::repository_error(format!("Failed to parse commit: {e}")))
@@ -96,9 +120,15 @@ pub trait RepositoryAccess: Send + Sync + Clone {
         &self,
         tree_hash: &str,
     ) -> Result<crate::internal::object::tree::Tree, ProtocolError> {
-        let data = self.get_object(tree_hash).await?;
-        let hash = ObjectHash::from_str(tree_hash)
+        // Resolve the repository kind before the first await: the default reads a
+
+        // thread-local, and the future may resume on another worker thread.
+
+        let kind = self.object_hash_kind();
+
+        let hash = ObjectHash::from_hex_for_kind(kind, tree_hash)
             .map_err(|e| ProtocolError::repository_error(format!("Invalid hash format: {e}")))?;
+        let data = self.get_object(tree_hash).await?;
 
         crate::internal::object::tree::Tree::from_bytes(&data, hash)
             .map_err(|e| ProtocolError::repository_error(format!("Failed to parse tree: {e}")))
@@ -665,5 +695,95 @@ mod tests {
         );
         let err = proto.info_refs("git-upload-pack").await.unwrap_err();
         assert!(matches!(err, ProtocolError::InvalidRequest(_)));
+    }
+
+    /// Mock repo that reports a fixed object-hash kind and serves one blob.
+    #[derive(Clone)]
+    struct FixedKindRepo {
+        kind: HashKind,
+        blob: Blob,
+    }
+
+    #[async_trait]
+    impl RepositoryAccess for FixedKindRepo {
+        fn object_hash_kind(&self) -> HashKind {
+            self.kind
+        }
+        async fn get_repository_refs(&self) -> Result<Vec<(String, String)>, ProtocolError> {
+            Ok(Vec::new())
+        }
+        async fn has_object(&self, object_hash: &str) -> Result<bool, ProtocolError> {
+            Ok(object_hash == self.blob.id.to_string())
+        }
+        async fn get_object(&self, _object_hash: &str) -> Result<Vec<u8>, ProtocolError> {
+            Ok(self.blob.data.clone())
+        }
+        async fn store_pack_data(&self, _pack_data: &[u8]) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+        async fn update_reference(
+            &self,
+            _ref_name: &str,
+            _old_hash: Option<&str>,
+            _new_hash: &str,
+        ) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+        async fn get_objects_for_pack(
+            &self,
+            _wants: &[String],
+            _haves: &[String],
+        ) -> Result<Vec<String>, ProtocolError> {
+            Ok(Vec::new())
+        }
+        async fn has_default_branch(&self) -> Result<bool, ProtocolError> {
+            Ok(false)
+        }
+        async fn post_receive_hook(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    /// `object_hash_kind()` defaults to the thread-local kind; an override drives the default
+    /// object accessors, which parse hashes against it and fail closed on a width mismatch.
+    #[tokio::test]
+    async fn repository_hash_kind_default_and_override() {
+        for (kind, other) in [
+            (HashKind::Sha1, HashKind::Sha256),
+            (HashKind::Sha256, HashKind::Sha1),
+        ] {
+            let _guard = set_hash_kind_for_test(kind);
+            // Default implementation follows the thread-local kind.
+            assert_eq!(MockRepo { refs: Vec::new() }.object_hash_kind(), kind);
+
+            // Override wins over the thread-local kind.
+            let blob = Blob::from_content_bytes_with_kind(other, b"hello".to_vec()).unwrap();
+            let repo = FixedKindRepo {
+                kind: other,
+                blob: blob.clone(),
+            };
+            assert_eq!(repo.object_hash_kind(), other);
+
+            let fetched = repo.get_blob(&blob.id.to_string()).await.unwrap();
+            assert_eq!(fetched.id, blob.id);
+            assert_eq!(fetched.id.kind(), other);
+
+            // A hash of the thread-local kind's width is rejected for this repository.
+            let wrong_width = ObjectHash::zero_for_kind(kind).to_string();
+            for err in [
+                repo.get_blob(&wrong_width).await.unwrap_err(),
+                repo.get_commit(&wrong_width).await.unwrap_err(),
+                repo.get_tree(&wrong_width).await.unwrap_err(),
+            ] {
+                let msg = err.to_string();
+                assert!(msg.contains("Invalid hash format"), "{msg}");
+                assert!(
+                    msg.contains(other.as_str())
+                        && msg.contains(&format!("expected {}", other.hex_len()))
+                        && msg.contains(&format!("got {}", kind.hex_len())),
+                    "{msg}"
+                );
+            }
+        }
     }
 }

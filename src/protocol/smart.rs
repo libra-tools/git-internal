@@ -122,11 +122,9 @@ where
             .into_iter()
             .map(|(name, hash)| super::types::GitRef { name, hash })
             .collect();
-        // capability add object-format，declare the wire hash kind
-        let format_cap = match self.wire_hash_kind {
-            HashKind::Sha1 => " object-format=sha1",
-            HashKind::Sha256 => " object-format=sha256",
-        };
+        // capability add object-format, declare the wire hash kind (single source:
+        // `HashKind::as_str`, no per-algorithm table here)
+        let format_cap = format!(" object-format={}", self.wire_hash_kind.as_str());
         // Determine capabilities based on service type
         let cap_list = match service_type {
             ServiceType::UploadPack => format!("{UPLOAD_CAP_LIST}{COMMON_CAP_LIST}{format_cap}"),
@@ -431,9 +429,10 @@ where
     pub fn parse_capabilities(&mut self, cap_str: &str) {
         for cap in cap_str.split_whitespace() {
             if let Some(fmt) = cap.strip_prefix("object-format=") {
-                match fmt {
-                    "sha1" => self.set_wire_hash_kind(HashKind::Sha1),
-                    "sha256" => self.set_wire_hash_kind(HashKind::Sha256),
+                // Single `HashKind` parser (GC-02); the wire value must be the exact
+                // lowercase name (GC-13), so a case-variant is treated as unknown.
+                match fmt.parse::<HashKind>() {
+                    Ok(kind) if kind.as_str() == fmt => self.set_wire_hash_kind(kind),
                     _ => {
                         tracing::warn!("Unknown object-format capability: {}", fmt);
                     }
@@ -739,6 +738,30 @@ mod tests {
             res.is_ok(),
             "expected SHA1 refs to be accepted when wire is SHA1"
         );
+    }
+
+    /// Unknown or non-canonical (mixed-case) object-format values are ignored with a warning
+    /// and leave the wire kind untouched; exact lowercase values are accepted.
+    #[test]
+    fn parse_capabilities_ignores_unknown_and_mixed_case_object_format() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let mut smart =
+            SmartProtocol::new(TransportProtocol::Http, TestRepoAccess::new(), TestAuth);
+        assert_eq!(smart.wire_hash_kind, HashKind::Sha1);
+
+        smart.parse_capabilities("object-format=SHA256 side-band-64k");
+        assert_eq!(smart.wire_hash_kind, HashKind::Sha1);
+        assert_eq!(smart.zero_id, ObjectHash::zero_str(HashKind::Sha1));
+
+        smart.parse_capabilities("object-format=md5");
+        assert_eq!(smart.wire_hash_kind, HashKind::Sha1);
+
+        smart.parse_capabilities("object-format=sha256");
+        assert_eq!(smart.wire_hash_kind, HashKind::Sha256);
+        assert_eq!(smart.zero_id, ObjectHash::zero_str(HashKind::Sha256));
+
+        smart.parse_capabilities("object-format=sha1");
+        assert_eq!(smart.wire_hash_kind, HashKind::Sha1);
     }
 
     /// parse_capabilities should switch wire hash kind and record declared capabilities.
