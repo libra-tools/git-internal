@@ -531,6 +531,248 @@ mod tests {
         hash.to_string().chars().take(7).collect()
     }
 
+    /// Apply a unified diff (as produced by `Diff` or by `git diff`) to `old` and return the
+    /// resulting text, including its terminal-newline state.
+    ///
+    /// Header lines before the first hunk are skipped. Every hunk header
+    /// `@@ -a[,b] +c[,d] @@` is checked against the position actually reached on both sides
+    /// (so hunks must be in order on old *and* new coordinates) and against the number of
+    /// old/new lines the hunk body really contains. Inside a hunk, `' '` context and `'-'`
+    /// lines must match `old` exactly and `'+'` lines are inserted. Each output line carries
+    /// its own newline flag: a line copied from `old` keeps old's (only old's last line can
+    /// lack one), an inserted line has one unless a `\ No newline at end of file` marker
+    /// follows it, and a marker after an old-side line must agree with `old`.
+    fn apply_unified_diff(old: &str, diff: &str) -> Result<String, String> {
+        // Strict `start[,count]`: exactly one or two decimal fields, and a start of 0 is
+        // only meaningful together with a count of 0 (the "before line 1" position).
+        fn parse_range(spec: &str) -> Result<(usize, usize), String> {
+            let parts: Vec<&str> = spec.split(',').collect();
+            let (start, count): (usize, usize) = match parts.as_slice() {
+                [start] => (
+                    start
+                        .parse()
+                        .map_err(|_| format!("bad hunk range: {spec}"))?,
+                    1,
+                ),
+                [start, count] => (
+                    start
+                        .parse()
+                        .map_err(|_| format!("bad hunk range: {spec}"))?,
+                    count
+                        .parse()
+                        .map_err(|_| format!("bad hunk range: {spec}"))?,
+                ),
+                _ => return Err(format!("bad hunk range: {spec}")),
+            };
+            if start == 0 && count != 0 {
+                return Err(format!("bad hunk range: {spec}"));
+            }
+            Ok((start, count))
+        }
+
+        let old_lines: Vec<&str> = old.lines().collect();
+        let old_ends_nl = old.ends_with('\n');
+        // Newline flag of old line `k`: every line but the last certainly ends with one.
+        let old_nl = |k: usize| k + 1 < old_lines.len() || old_ends_nl;
+        let mut out: Vec<(String, bool)> = Vec::new();
+        let mut cursor = 0usize;
+        // Set once a marker declared EOF on the new side: no further new-side line may follow.
+        let mut new_eof_marked = false;
+        let mut seen_hunk = false;
+        let mut lines = diff.lines().peekable();
+        while let Some(line) = lines.next() {
+            let Some(rest) = line.strip_prefix("@@ -") else {
+                // Anything before the first hunk is the file header; after a hunk, only
+                // another hunk header may follow (single-file patches only).
+                if seen_hunk {
+                    return Err(format!("unexpected line after hunk: {line}"));
+                }
+                continue;
+            };
+            seen_hunk = true;
+            let (old_spec, tail) = rest
+                .split_once(" +")
+                .ok_or_else(|| format!("bad hunk header: {line}"))?;
+            // `<new-range> @@[ section heading]`: the closing `@@` is mandatory.
+            let (new_spec, closing) = tail
+                .split_once(' ')
+                .ok_or_else(|| format!("bad hunk header: {line}"))?;
+            if closing != "@@" && !closing.starts_with("@@ ") {
+                return Err(format!("bad hunk header: {line}"));
+            }
+            let (old_start, old_count) = parse_range(old_spec)?;
+            let (new_start, new_count) = parse_range(new_spec)?;
+            // Ranges are 1-based; a count of 0 names the line *before* the hunk.
+            let hunk_start = if old_count == 0 {
+                old_start
+            } else {
+                old_start.saturating_sub(1)
+            };
+            if hunk_start < cursor || hunk_start > old_lines.len() {
+                return Err(format!("hunk out of order on the old side: {line}"));
+            }
+            for (k, line) in old_lines.iter().enumerate().take(hunk_start).skip(cursor) {
+                out.push((line.to_string(), old_nl(k)));
+            }
+            cursor = hunk_start;
+            let expected_new_start = if new_count == 0 {
+                out.len()
+            } else {
+                out.len() + 1
+            };
+            if new_start != expected_new_start {
+                return Err(format!(
+                    "hunk out of order on the new side: {line} (expected +{expected_new_start})"
+                ));
+            }
+            let (mut consumed_old, mut produced_new) = (0usize, 0usize);
+            let mut last_kind: Option<char> = None;
+            while let Some(&body) = lines.peek() {
+                if body.starts_with("@@ ") || body.starts_with("diff --git ") {
+                    break;
+                }
+                lines.next();
+                if let Some(ctx) = body.strip_prefix(' ') {
+                    if new_eof_marked {
+                        return Err("new-side line after a no-newline marker".to_string());
+                    }
+                    if old_lines.get(cursor) != Some(&ctx) {
+                        return Err(format!("context mismatch at old line {}", cursor + 1));
+                    }
+                    out.push((ctx.to_string(), old_nl(cursor)));
+                    cursor += 1;
+                    consumed_old += 1;
+                    produced_new += 1;
+                    last_kind = Some(' ');
+                } else if let Some(del) = body.strip_prefix('-') {
+                    if old_lines.get(cursor) != Some(&del) {
+                        return Err(format!("delete mismatch at old line {}", cursor + 1));
+                    }
+                    cursor += 1;
+                    consumed_old += 1;
+                    last_kind = Some('-');
+                } else if let Some(ins) = body.strip_prefix('+') {
+                    if new_eof_marked {
+                        return Err("new-side line after a no-newline marker".to_string());
+                    }
+                    out.push((ins.to_string(), true));
+                    produced_new += 1;
+                    last_kind = Some('+');
+                } else if body.starts_with('\\') {
+                    // Only git's canonical marker text is a marker; anything else that
+                    // starts with a backslash is malformed.
+                    if body != "\\ No newline at end of file" {
+                        return Err(format!("unexpected hunk line: {body}"));
+                    }
+                    // The marker describes the line just before it.
+                    match last_kind {
+                        Some('+') => {
+                            if let Some(last) = out.last_mut() {
+                                last.1 = false;
+                            }
+                            new_eof_marked = true;
+                        }
+                        Some(' ') | Some('-') => {
+                            // Old-side line: it must be old's last line and old must lack
+                            // the final newline (the context line's own flag already says so).
+                            if cursor != old_lines.len() || old_ends_nl {
+                                return Err("newline marker does not match old".to_string());
+                            }
+                            if last_kind == Some(' ') {
+                                new_eof_marked = true;
+                            }
+                        }
+                        _ => return Err("newline marker without a line".to_string()),
+                    }
+                    // The marker itself must be the last line of its hunk on that side; a
+                    // second marker is malformed too.
+                    last_kind = Some('\\');
+                } else {
+                    return Err(format!("unexpected hunk line: {body}"));
+                }
+            }
+            if consumed_old != old_count || produced_new != new_count {
+                return Err(format!(
+                    "hunk body has {consumed_old}/{produced_new} old/new lines but the header says {old_count}/{new_count}: {line}"
+                ));
+            }
+        }
+        // A new-side EOF marker forbids an implicitly copied tail as much as explicit lines.
+        if new_eof_marked && cursor != old_lines.len() {
+            return Err("old lines remain after a new-side no-newline marker".to_string());
+        }
+        for (k, line) in old_lines.iter().enumerate().skip(cursor) {
+            out.push((line.to_string(), old_nl(k)));
+        }
+        let mut text = String::new();
+        let last = out.len().checked_sub(1);
+        for (i, (line, nl)) in out.iter().enumerate() {
+            text.push_str(line);
+            // Only the last line may lack its newline; a missing one earlier would mean
+            // two lines were glued together, which `lines()` can never produce.
+            if *nl || Some(i) != last {
+                text.push('\n');
+            }
+        }
+        Ok(text)
+    }
+
+    /// The property a unified diff must satisfy, independent of which (equally valid) edit
+    /// script a particular algorithm picks for ambiguous regions: applying it to `old`
+    /// reproduces `new`, and every emitted `-`/`+` line really comes from `old`/`new`. The
+    /// same check is run on git's own output as a harness sanity test.
+    fn assert_diff_equivalent_to_git(
+        diff_output: &str,
+        git_output: &str,
+        old_text: &str,
+        new_text: &str,
+    ) {
+        // FIX-05 (registered candidate): the `Diff` engine never emits a
+        // `\ No newline at end of file` marker, so its output cannot express a missing
+        // terminal newline. The equivalence property is therefore only claimed for
+        // newline-terminated inputs, which this precondition makes explicit.
+        assert!(
+            old_text.ends_with('\n') && new_text.ends_with('\n'),
+            "equivalence harness requires newline-terminated inputs (see FIX-05)"
+        );
+        let ours = apply_unified_diff(old_text, diff_output).expect("our diff must apply");
+        assert_eq!(
+            ours, new_text,
+            "applying our diff to old must reproduce new"
+        );
+        let theirs = apply_unified_diff(old_text, git_output).expect("git diff must apply");
+        assert_eq!(
+            theirs, new_text,
+            "harness sanity: git's diff must reproduce new"
+        );
+
+        use std::collections::HashSet;
+        let old_set: HashSet<&str> = old_text.lines().collect();
+        let new_set: HashSet<&str> = new_text.lines().collect();
+        let mut in_hunk = false;
+        let (mut deleted, mut inserted) = (0usize, 0usize);
+        for line in diff_output.lines() {
+            if line.starts_with("@@ ") {
+                in_hunk = true;
+                continue;
+            }
+            if !in_hunk {
+                continue;
+            }
+            if let Some(del) = line.strip_prefix('-') {
+                assert!(old_set.contains(del), "deleted line not in old: {del:?}");
+                deleted += 1;
+            } else if let Some(ins) = line.strip_prefix('+') {
+                assert!(new_set.contains(ins), "inserted line not in new: {ins:?}");
+                inserted += 1;
+            }
+        }
+        assert!(
+            deleted + inserted > 0,
+            "a diff of different inputs must change something"
+        );
+    }
+
     /// Helper: run `git diff --no-index` on temp files and normalize headers for comparison.
     fn normalized_git_diff(
         logical_path: &str,
@@ -612,52 +854,169 @@ mod tests {
         assert!(diff.contains("Binary files differ"));
     }
 
-    /// Fixture diff should match git's inserted/deleted lines.
+    /// The equivalence harness is not vacuous: wrong deleted/context lines, hunks out of order
+    /// on either side, wrong header counts, a wrong terminal-newline state, or a patch that
+    /// applies but yields the wrong text are all rejected.
+    #[test]
+    fn apply_unified_diff_rejects_wrong_patches() {
+        let old = "a\nb\nc\n";
+        let good = "--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+        assert_eq!(apply_unified_diff(old, good).unwrap(), "a\nB\nc\n");
+        // Deleted line does not exist at that position in old.
+        assert!(apply_unified_diff(old, "@@ -1,3 +1,3 @@\n a\n-x\n+B\n c\n").is_err());
+        // Context line does not match old.
+        assert!(apply_unified_diff(old, "@@ -1,3 +1,3 @@\n z\n-b\n+B\n c\n").is_err());
+        // Hunks out of order on the old side.
+        assert!(apply_unified_diff(old, "@@ -3 +3 @@\n-c\n+C\n@@ -1 +1 @@\n-a\n+A\n").is_err());
+        // Hunks ordered on the old side but inconsistent on the new side.
+        assert!(apply_unified_diff(old, "@@ -1 +3 @@\n-a\n+A\n@@ -3 +1 @@\n-c\n+C\n").is_err());
+        // Malformed headers: extra range fields, a 0 start with a nonzero count, a missing
+        // closing `@@`, or a new-side 0 start with count 1.
+        for bad in [
+            "@@ -1,3,9 +1,3 @@\n a\n-b\n+B\n c\n",
+            "@@ -0,3 +1,3 @@\n a\n-b\n+B\n c\n",
+            "@@ -1,3 +1,3\n a\n-b\n+B\n c\n",
+            "@@ -1,3 +0 @@\n a\n-b\n+B\n c\n",
+            "@@ -1,3 +1,x @@\n a\n-b\n+B\n c\n",
+        ] {
+            assert!(apply_unified_diff(old, bad).is_err(), "{bad:?}");
+        }
+        // Header counts that do not match the hunk body.
+        assert!(apply_unified_diff(old, "@@ -1,2 +1,3 @@\n a\n-b\n+B\n c\n").is_err());
+        assert!(apply_unified_diff(old, "@@ -1,3 +1,2 @@\n a\n-b\n+B\n c\n").is_err());
+        // Terminal-newline state is part of the result: removing or adding the final newline
+        // is a visible change, and a marker that contradicts old is rejected.
+        let drop_newline = "@@ -3 +3 @@\n-c\n+c\n\\ No newline at end of file\n";
+        assert_eq!(apply_unified_diff(old, drop_newline).unwrap(), "a\nb\nc");
+        let old_no_nl = "a\nb\nc";
+        let add_newline = "@@ -3 +3 @@\n-c\n\\ No newline at end of file\n+c\n";
+        assert_eq!(
+            apply_unified_diff(old_no_nl, add_newline).unwrap(),
+            "a\nb\nc\n"
+        );
+        assert!(apply_unified_diff(old, add_newline).is_err());
+        // A hunk in the middle: the copied tail keeps old's newline state.
+        let mid = "@@ -1,2 +1,2 @@\n-a\n+A\n b\n";
+        assert_eq!(apply_unified_diff(old, mid).unwrap(), "A\nb\nc\n");
+        assert_eq!(apply_unified_diff(old_no_nl, mid).unwrap(), "A\nb\nc");
+        // Deleting the final line that lacks a newline: the new last line ("a") keeps the
+        // newline it had in old.
+        let delete_last = "@@ -1,2 +1 @@\n a\n-b\n\\ No newline at end of file\n";
+        assert_eq!(apply_unified_diff("a\nb", delete_last).unwrap(), "a\n");
+        // Appending after a last line that lacks a newline: git emits the marker after the
+        // deleted copy of that line, then re-adds it with a newline.
+        let append = "@@ -2 +2,2 @@\n-b\n\\ No newline at end of file\n+b\n+c\n";
+        assert_eq!(apply_unified_diff("a\nb", append).unwrap(), "a\nb\nc\n");
+        // A marker means EOF for its side: a further new-side line (in the same or a later
+        // hunk) or a second marker is malformed.
+        for bad in [
+            "@@ -1 +1,2 @@\n-a\n+b\n\\ No newline at end of file\n+c\n",
+            "@@ -1 +1,2 @@\n-a\n+b\n\\ No newline at end of file\n c\n",
+            "@@ -1 +1 @@\n-a\n+b\n\\ No newline at end of file\n\\ No newline at end of file\n",
+            // Only the canonical marker text counts; other backslash lines are malformed.
+            "@@ -1 +1 @@\n-a\n+b\n\\ no newline\n",
+            // `@@@` is not a valid closing.
+            "@@ -1 +1 @@@\n-a\n+b\n",
+            // After a hunk only another hunk header may follow.
+            "@@ -1 +1 @@\n-a\n+b\n@@ bogus\n",
+            "@@ -1 +1 @@\n-a\n+b\ntrailing garbage\n",
+        ] {
+            assert!(apply_unified_diff("a\n", bad).is_err(), "{bad:?}");
+        }
+        // Blank context lines must carry their space prefix; an unprefixed empty line is
+        // malformed (git and this crate both emit " ").
+        assert_eq!(
+            apply_unified_diff("a\n\nc\n", "@@ -1,3 +1,3 @@\n a\n \n-c\n+C\n").unwrap(),
+            "a\n\nC\n"
+        );
+        assert!(apply_unified_diff("a\n\nc\n", "@@ -1,3 +1,3 @@\n a\n\n-c\n+C\n").is_err());
+        // A new-side marker followed by a later hunk, or by an implicitly copied old tail,
+        // is malformed: the marker declared EOF.
+        for bad in [
+            "@@ -1 +1 @@\n-a\n+A\n\\ No newline at end of file\n@@ -2 +2 @@\n-b\n+B\n",
+            "@@ -1 +1 @@\n-a\n+A\n\\ No newline at end of file\n",
+        ] {
+            assert!(apply_unified_diff("a\nb\n", bad).is_err(), "{bad:?}");
+        }
+        // Context at EOF without a newline: the marker agrees with old and the result keeps
+        // the missing newline.
+        let ctx_eof = "@@ -1,2 +1,2 @@\n-a\n+A\n b\n\\ No newline at end of file\n";
+        assert_eq!(apply_unified_diff("a\nb", ctx_eof).unwrap(), "A\nb");
+        // A patch that applies but yields the wrong text fails the equivalence assertion,
+        // and so does one whose result differs only in the terminal newline.
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_diff_equivalent_to_git(good, good, old, "a\nb\nc\n");
+            })
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_diff_equivalent_to_git(good, good, old, "a\nB\nc");
+            })
+            .is_err()
+        );
+    }
+
+    /// Pins the limitation registered as FIX-05: the engine emits no
+    /// `\ No newline at end of file` marker, so a change that only touches the terminal
+    /// newline is not representable in its output (applying it yields a newline-terminated
+    /// file), and the equivalence harness refuses such inputs. Update when FIX-05 lands.
+    #[test]
+    fn fix05_diff_engine_drops_terminal_newline_state() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha256);
+        let (diff_output, _, _) = run_diff("nl.txt", b"a\nb", b"a\nB");
+        assert!(!diff_output.contains("\\ No newline"), "{diff_output}");
+        assert_eq!(apply_unified_diff("a\nb", &diff_output).unwrap(), "a\nB\n");
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_diff_equivalent_to_git(&diff_output, &diff_output, "a\nb", "a\nB");
+            })
+            .is_err()
+        );
+    }
+
+    /// Fixture diff must be patch-equivalent to git's (both reproduce `new` from `old`).
     #[test]
     fn diff_matches_git_for_fixture() {
-        let _guard = set_hash_kind_for_test(HashKind::Sha256); //use it to test SHA1/SHA-256 diffs as well
         let base: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "diff"]
             .iter()
             .collect();
         let old_bytes = fs::read(base.join("old.txt")).expect("read old.txt");
         let new_bytes = fs::read(base.join("new.txt")).expect("read new.txt");
-
-        let (diff_output, old_hash, new_hash) = run_diff("fixture.txt", &old_bytes, &new_bytes);
-        let git_output =
-            normalized_git_diff("fixture.txt", &old_bytes, &new_bytes, &old_hash, &new_hash)
-                .expect("git diff output");
-
-        fn collect(s: &str, prefix: char) -> Vec<String> {
-            s.lines()
-                .filter(|l| l.starts_with(prefix))
-                .map(|l| l.to_string())
-                .collect()
+        // GC-07: the property must hold under both standard object formats (the hash kind
+        // only changes the `index` header line, but the whole path is exercised for each).
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let _guard = set_hash_kind_for_test(kind);
+            let (diff_output, old_hash, new_hash) = run_diff("fixture.txt", &old_bytes, &new_bytes);
+            assert_eq!(old_hash.kind(), kind);
+            let git_output =
+                normalized_git_diff("fixture.txt", &old_bytes, &new_bytes, &old_hash, &new_hash)
+                    .expect("git diff output");
+            check_fixture(&diff_output, &git_output, &old_bytes, &new_bytes);
         }
-        let ours_del = collect(&diff_output, '-');
-        let ours_ins = collect(&diff_output, '+');
-        let git_del = collect(&git_output, '-');
-        let git_ins = collect(&git_output, '+');
-
-        use std::collections::HashSet;
-        let ours_del_set: HashSet<_> = ours_del.iter().collect();
-        let git_del_set: HashSet<_> = git_del.iter().collect();
-        let ours_ins_set: HashSet<_> = ours_ins.iter().collect();
-        let git_ins_set: HashSet<_> = git_ins.iter().collect();
-
-        assert_eq!(
-            ours_del_set, git_del_set,
-            "deleted lines differ from git output"
-        );
-        assert_eq!(
-            ours_ins_set, git_ins_set,
-            "inserted lines differ from git output"
-        );
     }
 
-    /// Large input should still match git's inserted/deleted sets.
+    fn check_fixture(diff_output: &str, git_output: &str, old_bytes: &[u8], new_bytes: &[u8]) {
+        // Different diff algorithms may legitimately choose different edit scripts for
+        // ambiguous regions (e.g. which of several identical `}` lines is "deleted"), so the
+        // comparison with git is by patch equivalence, not by textual identity of the
+        // deleted/inserted line sets.
+        let old_text = String::from_utf8(old_bytes.to_vec()).expect("old.txt is UTF-8");
+        let new_text = String::from_utf8(new_bytes.to_vec()).expect("new.txt is UTF-8");
+        assert_diff_equivalent_to_git(diff_output, git_output, &old_text, &new_text);
+    }
+
+    /// Large input must still be patch-equivalent to git's output.
     #[test]
     fn diff_matches_git_for_large_change() {
-        let _guard = set_hash_kind_for_test(HashKind::Sha256);
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let _guard = set_hash_kind_for_test(kind);
+            large_change_case();
+        }
+    }
+
+    fn large_change_case() {
         let old_lines: Vec<String> = (0..5_000).map(|i| format!("line {i}")).collect();
         let mut new_lines = old_lines.clone();
         for idx in [10, 499, 1_234, 3_210, 4_999] {
@@ -683,19 +1042,7 @@ mod tests {
         )
         .expect("git diff output");
 
-        fn collect(s: &str, prefix: char) -> Vec<String> {
-            s.lines()
-                .filter(|l| l.starts_with(prefix))
-                .map(|l| l.to_string())
-                .collect()
-        }
-        use std::collections::HashSet;
-        let ours_del: HashSet<_> = collect(&diff_output, '-').into_iter().collect();
-        let ours_ins: HashSet<_> = collect(&diff_output, '+').into_iter().collect();
-        let git_del: HashSet<_> = collect(&git_output, '-').into_iter().collect();
-        let git_ins: HashSet<_> = collect(&git_output, '+').into_iter().collect();
-        assert_eq!(ours_del, git_del, "deleted lines differ from git output");
-        assert_eq!(ours_ins, git_ins, "inserted lines differ from git output");
+        assert_diff_equivalent_to_git(&diff_output, &git_output, &old_text, &new_text);
     }
 
     /// Line mapping operations should match expected Equal/Delete/Insert sequence.
