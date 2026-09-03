@@ -79,7 +79,7 @@
 | 物件 | 顯式 kind 建構 / 解析 |
 |---|---|
 | `Blob` | `from_content_with_kind(kind, &str)`、`from_content_bytes_with_kind(kind, Vec<u8>)` |
-| `Tree` | `from_tree_items_with_kind(kind, items)`、`from_bytes_with_kind(bytes, kind)`、`rehash_with_kind(kind)`；`Tree::from_bytes(bytes, hash)` 依 `hash.kind()` 切分 entry ID |
+| `Tree` / `TreeItem` | `Tree::from_tree_items_with_kind(kind, items)`、`Tree::rehash_with_kind(kind)`、`TreeItem::from_bytes_with_kind(bytes, kind)`；`Tree::from_bytes(bytes, hash)` 依 `hash.kind()` 切分 entry ID |
 | `Commit` | `new_with_kind(kind, author, committer, tree_id, parents, msg)`、`from_tree_id_with_kind(kind, …)`；`from_bytes` 依傳入 hash 的 kind 解析 `tree` / `parent` 行 |
 | `Tag` / `Note` | `new_with_kind(kind, …)`、`Note::from_content_with_kind(kind, …)` |
 | 任意 `ObjectTrait` | `from_buf_read_with_kind(reader, size, kind)`（reader hasher kind ≠ `kind` → `KindMismatch`） |
