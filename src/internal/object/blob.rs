@@ -31,7 +31,7 @@ use std::fmt::Display;
 
 use crate::{
     errors::GitError,
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash},
     internal::object::{ObjectTrait, types::ObjectType},
 };
 
@@ -83,9 +83,27 @@ impl ObjectTrait for Blob {
 }
 
 impl Blob {
+    /// Create a new Blob from content bytes, hashing with an explicit repository `kind`.
+    ///
+    /// Does not consult the thread-local [`HashKind`]. Fails closed (never
+    /// panics) if the ID cannot be computed.
+    pub fn from_content_bytes_with_kind(
+        kind: HashKind,
+        content: Vec<u8>,
+    ) -> Result<Self, GitError> {
+        let id = ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Blob, &content)?;
+        Ok(Blob { id, data: content })
+    }
+
+    /// Create a new Blob from a content string, hashing with an explicit repository `kind`.
+    pub fn from_content_with_kind(kind: HashKind, content: &str) -> Result<Self, GitError> {
+        Self::from_content_bytes_with_kind(kind, content.as_bytes().to_vec())
+    }
+
     /// Create a new Blob object from the given content string.
     /// - This is a convenience method for creating a Blob from a string.
     /// - It converts the string to bytes and then calls `from_content_bytes`.
+    /// - Uses the thread-local [`HashKind`]; see [`Blob::from_content_with_kind`].
     pub fn from_content(content: &str) -> Self {
         let content = content.as_bytes().to_vec();
         Blob::from_content_bytes(content)
@@ -93,6 +111,7 @@ impl Blob {
 
     /// Create a new Blob object from the given content bytes.
     /// - some file content can't be represented as a string (UTF-8), so we need to use bytes.
+    /// - Uses the thread-local [`HashKind`]; see [`Blob::from_content_bytes_with_kind`].
     pub fn from_content_bytes(content: Vec<u8>) -> Self {
         Blob {
             // Calculate the hash from the type and content

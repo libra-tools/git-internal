@@ -21,7 +21,7 @@ use encoding_rs::GBK;
 
 use crate::{
     errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash},
     internal::object::{ObjectTrait, ObjectType},
 };
 
@@ -102,8 +102,9 @@ impl TreeItemMode {
             b"100664" => TreeItemMode::Blob,
             b"100640" => TreeItemMode::Blob,
             _ => {
+                // Non-UTF-8 modes are reported lossily instead of panicking.
                 return Err(GitError::InvalidTreeItem(
-                    String::from_utf8(mode.to_vec()).unwrap(),
+                    String::from_utf8_lossy(mode).into_owned(),
                 ));
             }
         })
@@ -178,12 +179,52 @@ impl TreeItem {
         TreeItem { mode, id, name }
     }
 
+    /// Parse one `<mode> <name>\0<binary object ID>` entry whose ID belongs to an
+    /// explicit repository `kind`.
+    ///
+    /// Does not consult the thread-local [`HashKind`]. Fails closed (never
+    /// panics) on a malformed entry or an ID of the wrong width.
+    pub fn from_bytes_with_kind(bytes: &[u8], kind: HashKind) -> Result<Self, GitError> {
+        let malformed = |what: &str| {
+            GitError::InvalidTreeItem(format!(
+                "tree entry is missing its {what} ({} bytes, expected {} mode/name bytes + 1 NUL + {}-byte {kind} id)",
+                bytes.len(),
+                bytes.len().saturating_sub(kind.size() + 1),
+                kind.size()
+            ))
+        };
+        let space = memchr::memchr(b' ', bytes).ok_or_else(|| malformed("mode"))?;
+        let (mode, rest) = (&bytes[..space], &bytes[space + 1..]);
+        let nul = memchr::memchr(0, rest).ok_or_else(|| malformed("NUL separator"))?;
+        let (raw_name, id) = (&rest[..nul], &rest[nul + 1..]);
+
+        let name = match String::from_utf8(raw_name.to_vec()) {
+            Ok(name) => name,
+            Err(_) => {
+                let (decoded, _, had_errors) = GBK.decode(raw_name);
+                if had_errors {
+                    return Err(GitError::InvalidTreeItem(format!(
+                        "Unsupported raw format: {raw_name:?}"
+                    )));
+                }
+                decoded.to_string()
+            }
+        };
+        Ok(TreeItem {
+            mode: TreeItemMode::tree_item_type_from_bytes(mode)?,
+            id: ObjectHash::from_bytes_for_kind(kind, id)?,
+            name,
+        })
+    }
+
     /// Create a new TreeItem from a byte vector, split into a mode, id and name, the TreeItem format is:
     ///
     /// ```bash
     /// <mode> <name>\0<binary object ID>
     /// ```
     ///
+    /// Legacy entry point: the ID width comes from the thread-local
+    /// [`HashKind`]. Prefer [`TreeItem::from_bytes_with_kind`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, GitError> {
         let mut parts = bytes.splitn(2, |b| *b == b' ');
         let mode = parts.next().unwrap();
@@ -282,7 +323,40 @@ impl Display for Tree {
 }
 
 impl Tree {
+    /// Serialize `items` and verify every entry ID belongs to `kind`.
+    fn items_data_for_kind(kind: HashKind, items: &[TreeItem]) -> Result<Vec<u8>, GitError> {
+        let mut data = Vec::new();
+        for item in items {
+            item.id.ensure_kind(kind)?;
+            data.extend_from_slice(item.to_data().as_slice());
+        }
+        Ok(data)
+    }
+
+    /// Create a new Tree from a list of TreeItems, hashing with an explicit repository `kind`.
+    ///
+    /// Does not consult the thread-local [`HashKind`]. Every entry ID must
+    /// belong to `kind`; a cross-kind reference fails closed with
+    /// [`GitError::InvalidHashValue`].
+    pub fn from_tree_items_with_kind(
+        kind: HashKind,
+        tree_items: Vec<TreeItem>,
+    ) -> Result<Self, GitError> {
+        if tree_items.is_empty() {
+            return Err(GitError::EmptyTreeItems(
+                "When export tree object to meta, the items is empty".to_string(),
+            ));
+        }
+        let data = Self::items_data_for_kind(kind, &tree_items)?;
+        Ok(Tree {
+            id: ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Tree, &data)?,
+            tree_items,
+        })
+    }
+
     /// Create a new Tree from a list of TreeItems
+    ///
+    /// Uses the thread-local [`HashKind`]; see [`Tree::from_tree_items_with_kind`].
     pub fn from_tree_items(tree_items: Vec<TreeItem>) -> Result<Self, GitError> {
         if tree_items.is_empty() {
             return Err(GitError::EmptyTreeItems(
@@ -302,7 +376,18 @@ impl Tree {
         })
     }
 
+    /// Recalculate the tree ID for an explicit repository `kind` after the entries changed.
+    ///
+    /// Every entry ID must belong to `kind`; on failure the ID is left unchanged.
+    pub fn rehash_with_kind(&mut self, kind: HashKind) -> Result<(), GitError> {
+        let data = Self::items_data_for_kind(kind, &self.tree_items)?;
+        self.id = ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Tree, &data)?;
+        Ok(())
+    }
+
     /// After the subdirectory is changed, the hash value of the tree is recalculated.
+    ///
+    /// Uses the thread-local [`HashKind`]; see [`Tree::rehash_with_kind`].
     pub fn rehash(&mut self) {
         let mut data = Vec::new();
         for item in &self.tree_items {
@@ -320,23 +405,27 @@ impl TryFrom<&[u8]> for Tree {
     }
 }
 impl ObjectTrait for Tree {
+    /// Parse a tree body. Entry IDs are sliced with the width of `hash.kind()` —
+    /// the repository kind of the tree being loaded — never the thread-local
+    /// kind, so an explicit-kind loader works on any thread.
     fn from_bytes(data: &[u8], hash: ObjectHash) -> Result<Self, GitError>
     where
         Self: Sized,
     {
+        let kind = hash.kind();
         let mut tree_items = Vec::new();
         let mut i = 0;
         while i < data.len() {
             // Find the position of the null byte (0x00)
             if let Some(index) = memchr::memchr(0x00, &data[i..]) {
                 // Calculate the next position
-                let next = i + index + get_hash_kind().size() + 1; // +1 for the null byte
+                let next = i + index + kind.size() + 1; // +1 for the null byte
                 if next > data.len() {
                     return Err(GitError::InvalidTreeObject);
-                } //check bounds TreeItem::from_bytes will panic if out of bounds
+                } //check bounds before slicing the fixed-width id
                 // Extract the bytes and create a TreeItem
                 let item_data = &data[i..next];
-                let tree_item = TreeItem::from_bytes(item_data)?;
+                let tree_item = TreeItem::from_bytes_with_kind(item_data, kind)?;
 
                 tree_items.push(tree_item);
 
@@ -379,6 +468,7 @@ mod tests {
     use std::str::FromStr;
 
     use crate::{
+        errors::GitError,
         hash::{HashKind, ObjectHash, set_hash_kind_for_test},
         internal::object::tree::{Tree, TreeItem, TreeItemMode},
     };
@@ -433,6 +523,49 @@ mod tests {
     }
 
     /// Tree construction from items (SHA-1).
+    /// Explicit-kind entry parsing fails closed on malformed input (never panics).
+    #[test]
+    fn tree_item_from_bytes_with_kind_rejects_malformed() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha256);
+        let id = [0x11u8; 20];
+
+        // Non-UTF-8 mode bytes: reported lossily, not a panic.
+        let mut bad_mode = b"\xff\xfe name\0".to_vec();
+        bad_mode.extend_from_slice(&id);
+        assert!(matches!(
+            TreeItem::from_bytes_with_kind(&bad_mode, HashKind::Sha1),
+            Err(GitError::InvalidTreeItem(_))
+        ));
+
+        // Missing NUL separator / missing space.
+        assert!(matches!(
+            TreeItem::from_bytes_with_kind(b"100644 name", HashKind::Sha1),
+            Err(GitError::InvalidTreeItem(_))
+        ));
+        assert!(matches!(
+            TreeItem::from_bytes_with_kind(b"100644", HashKind::Sha1),
+            Err(GitError::InvalidTreeItem(_))
+        ));
+
+        // Wrong id width for the requested kind (20 bytes offered as SHA-256).
+        let mut short_id = b"100644 name\0".to_vec();
+        short_id.extend_from_slice(&id);
+        match TreeItem::from_bytes_with_kind(&short_id, HashKind::Sha256) {
+            Err(GitError::InvalidHashValue(msg)) => {
+                assert!(
+                    msg.contains("sha256") && msg.contains("32") && msg.contains("20"),
+                    "{msg}"
+                )
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Correct width parses regardless of the thread-local kind.
+        let item = TreeItem::from_bytes_with_kind(&short_id, HashKind::Sha1).unwrap();
+        assert_eq!(item.id, ObjectHash::Sha1(id));
+        assert_eq!(item.name, "name");
+    }
+
     #[test]
     fn tree_from_items_sha1() {
         tree_round_trip(

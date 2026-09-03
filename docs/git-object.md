@@ -5,7 +5,8 @@ This document summarizes the object formats supported by git-internal, how IDs a
 ## Common Format and Hashing
 
 - Storage format: `<type> <size>\0<raw-bytes>`, where `type` is `blob/tree/commit/tag` and `size` is the raw data length (decimal string).
-- Hashing: `ObjectHash::from_type_and_data(ObjectType, data)` produces an ID using the current thread hash algorithm (Currently supports SHA-1 and SHA-256); switch via `set_hash_kind` / `set_hash_kind_for_test`.
+- Hashing: `ObjectHash::from_type_and_data_for_kind(HashKind, ObjectType, data)` produces an ID for an explicit repository hash kind (currently SHA-1 and SHA-256) and fails closed (`HashError`) for delta types; `ObjectHash::from_type_and_data(ObjectType, data)` is the thread-local wrapper (switch via `set_hash_kind` / `set_hash_kind_for_test`).
+- Repository hash context: the thread-local kind is only a compatibility default for the single-repository workflow. Code that may run on a worker thread, async task, cache or protocol callback belonging to another repository must use the explicit-kind API: `ObjectTrait::object_hash_for_kind(kind)`, `ObjectTrait::from_buf_read_with_kind(reader, size, kind)` (with `ReadBoxed::new_with_kind`), and the `*_with_kind` constructors listed per object below. The `*_with_kind` constructors, `ReadBoxed::new_with_kind` and `object_hash_for_kind` return `Result<_, GitError>` and never panic, and they reject references whose `ObjectHash` belongs to another kind (`GitError::InvalidHashValue` with a `hash kind mismatch` message). `from_buf_read_with_kind` finalizes the ID without panicking and then delegates to the type's `from_bytes`: `Tree::from_bytes` slices entry IDs with the width of the hash it is given (`hash.kind()`) and fails closed on malformed entries, so trees load correctly for any repository kind on any thread; `Commit::from_bytes` and `Tag::from_bytes` still infer reference IDs from their hex length (and `Commit::from_bytes` keeps its existing panic paths on malformed input), while `Note::from_bytes` fills a fixed legacy SHA-1 zero target — B3-02b replaces these three with explicit-kind parsing.
 - Types: `ObjectType` offers `to_string`/`to_u8`/`from_u8`/`from_string`, covering base objects (Commit/Tree/Blob/Tag) and delta objects (OffsetDelta/HashDelta/OffsetZstdDelta—extension).
 - Serialization: Each object’s `to_data` returns `<type><size>\0<body>`; `ObjectHash::to_string()` emits hex, `to_data()` returns raw bytes.
 
@@ -14,7 +15,7 @@ This document summarizes the object formats supported by git-internal, how IDs a
 - Location: `object/blob.rs`.
 - Meaning: File content snapshot, no path/permission (those live in Tree).
 - Structure: `Blob { id: ObjectHash, data: Vec<u8> }`.
-- Build: `Blob::from_content` / `from_content_bytes` auto-compute the hash; `from_bytes(data, hash)` parses with a known hash.
+- Build: `Blob::from_content` / `from_content_bytes` auto-compute the hash with the thread-local kind; `from_content_with_kind(kind, ..)` / `from_content_bytes_with_kind(kind, ..)` take the repository kind explicitly; `from_bytes(data, hash)` parses with a known hash.
 - Serialize: `to_data()` returns raw content (header is implied when hashing with `ObjectHash::from_type_and_data`).
 
 ## Tree and TreeItem
@@ -22,15 +23,15 @@ This document summarizes the object formats supported by git-internal, how IDs a
 - Location: `object/tree.rs`.
 - TreeItem format: `"<mode> <name>\0<id-bytes>"`; modes include `100644`/`100755`/`120000`/`160000`/`40000` (gitlink).
 - Structure: `TreeItem { mode: TreeItemMode, id: ObjectHash, name: String }`; `Tree { id, tree_items: Vec<TreeItem> }`.
-- Build: `Tree::from_tree_items(items)` computes the tree hash; `rehash` recomputes after modifications.
-- Parse: `Tree::from_bytes(data, hash)` splits IDs using current hash length (20/32 bytes); TreeItem parsing has a GBK fallback for non-UTF-8 names.
+- Build: `Tree::from_tree_items(items)` computes the tree hash with the thread-local kind; `from_tree_items_with_kind(kind, items)` / `rehash_with_kind(kind)` take the repository kind explicitly and require every entry ID to belong to that kind; `rehash` recomputes after modifications with the thread-local kind.
+- Parse: `Tree::from_bytes(data, hash)` splits IDs using the width of `hash.kind()` (20/32 bytes) via `TreeItem::from_bytes_with_kind(bytes, kind)`, which fails closed on malformed entries; the legacy `TreeItem::from_bytes(bytes)` uses the thread-local kind. TreeItem parsing has a GBK fallback for non-UTF-8 names.
 
 ## Commit
 
 - Location: `object/commit.rs`.
 - Field order: `tree <tree-id>`, zero or more `parent <parent-id>`, `author <signature>`, `committer <signature>`, blank line, then message (may include signatures).
 - Structure: `Commit { id, tree_id, parent_commit_ids, author, committer, message }`.
-- Build: `Commit::new` (explicit signatures) or `from_tree_id` (convenience with current-time signatures); both use `ObjectHash::from_type_and_data` to derive the ID.
+- Build: `Commit::new` (explicit signatures) or `from_tree_id` (convenience with current-time signatures); both use `ObjectHash::from_type_and_data` (thread-local kind) to derive the ID. `Commit::new_with_kind(kind, ..)` / `from_tree_id_with_kind(kind, ..)` derive the ID for an explicit kind and require `tree_id` and every parent ID to belong to it.
 - Parse: `from_bytes` splits lines and uses `Signature::from_data` for author/committer.
 - Helper: `format_message` skips PGP signature blocks or returns the first non-empty line.
 
@@ -44,14 +45,14 @@ This document summarizes the object formats supported by git-internal, how IDs a
   `tagger <name> <email> <timestamp> <tz>`  
   `<message>` (after a blank line)
 - Structure: `Tag { id, object_hash, object_type, tag_name, tagger, message }`.
-- Build: `Tag::new(object_hash, object_type, tag_name, tagger, message)`; hash is computed from serialized content.
+- Build: `Tag::new(object_hash, object_type, tag_name, tagger, message)`; hash is computed from serialized content with the thread-local kind. `Tag::new_with_kind(kind, ..)` derives the ID for an explicit kind and requires `object_hash` to belong to it.
 - Parse: `from_bytes` validates UTF-8 and errors on invalid fields; `to_data` emits the format above.
 
 ## Note
 
 - Location: `object/note.rs`.
 - Meaning: An annotation attached to an object; internally treated as a Blob (`get_type` returns Blob), and hashed using Blob rules.
-- Build/Parse: `Note::from_content(content)` builds a note for a placeholder target; `Note::new(target_object_id, content)` associates it to a specific object. Use `from_bytes` to parse existing data.
+- Build/Parse: `Note::from_content(content)` builds a note for a placeholder target (legacy: SHA-1 zero ID); `Note::new(target_object_id, content)` associates it to a specific object. `Note::new_with_kind(kind, target, content)` / `from_content_with_kind(kind, content)` derive the ID for an explicit kind, require the target to belong to it, and use `ObjectHash::zero_for_kind(kind)` as the placeholder. Use `from_bytes` to parse existing data.
 
 ## Signature
 
@@ -66,6 +67,7 @@ This document summarizes the object formats supported by git-internal, how IDs a
 
 ## Pack/Protocol Integration
 
+- Loading from a zlib stream: `ReadBoxed::new_with_kind(reader, obj_type, size, kind)` seeds the hasher for the repository kind (`ReadBoxed::new` uses the thread-local kind); `ObjectTrait::from_buf_read_with_kind` then finalizes the ID from that hasher and fails closed if the requested kind differs from the reader's.
 - Pack decode yields `Entry` with `obj_type`, `hash`, `data`; these can be parsed by the object modules above.
 - Pack encode expects `ObjectHash` plus raw data; `PackEncoder` uses `ObjectType` to craft headers and validate hashes.
 - Protocol (upload-pack/receive-pack) cares about object ID/type consistency; content parsing is left to the caller or higher layers as needed.

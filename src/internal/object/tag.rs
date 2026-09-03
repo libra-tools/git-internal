@@ -42,7 +42,7 @@ use bstr::ByteSlice;
 
 use crate::{
     errors::GitError,
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash},
     internal::object::{ObjectTrait, ObjectType, signature::Signature},
 };
 
@@ -83,6 +83,34 @@ impl Tag {
     //     Tag::new_from_meta(meta)
     // }
 
+    /// Create an annotated tag and derive its ID with an explicit repository `kind`.
+    ///
+    /// Does not consult the thread-local [`HashKind`]. `object_hash` must
+    /// belong to `kind`; a cross-kind reference fails closed with
+    /// [`GitError::InvalidHashValue`]. Never panics.
+    pub fn new_with_kind(
+        kind: HashKind,
+        object_hash: ObjectHash,
+        object_type: ObjectType,
+        tag_name: String,
+        tagger: Signature,
+        message: String,
+    ) -> Result<Self, GitError> {
+        object_hash.ensure_kind(kind)?;
+        let mut tag = Self {
+            id: ObjectHash::zero_for_kind(kind),
+            object_hash,
+            object_type,
+            tag_name,
+            tagger,
+            message,
+        };
+        let data = tag.to_data()?;
+        tag.id = ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Tag, &data)?;
+        Ok(tag)
+    }
+
+    /// Create an annotated tag using the thread-local [`HashKind`]; see [`Tag::new_with_kind`].
     pub fn new(
         object_hash: ObjectHash,
         object_type: ObjectType,

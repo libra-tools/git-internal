@@ -14,7 +14,7 @@ use std::fmt::Display;
 
 use crate::{
     errors::GitError,
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash},
     internal::object::{ObjectTrait, ObjectType},
 };
 
@@ -63,8 +63,39 @@ impl Note {
     /// * `target_object_id` - The ObjectHash of the object to annotate
     /// * `content` - The textual content of the note
     ///
+    /// Create a Note for `target_object_id` with an explicit repository `kind`.
+    ///
+    /// Notes are hashed as blobs. Does not consult the thread-local
+    /// [`HashKind`]; the target ID must belong to `kind`, otherwise the call
+    /// fails closed with [`GitError::InvalidHashValue`]. Never panics.
+    pub fn new_with_kind(
+        kind: HashKind,
+        target_object_id: ObjectHash,
+        content: String,
+    ) -> Result<Self, GitError> {
+        target_object_id.ensure_kind(kind)?;
+        let id =
+            ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Blob, content.as_bytes())?;
+        Ok(Self {
+            id,
+            target_object_id,
+            content,
+        })
+    }
+
+    /// Create a Note with a placeholder (zero) target of an explicit repository `kind`.
+    ///
+    /// The placeholder target is [`ObjectHash::zero_for_kind`] so that it has the
+    /// right width for the repository; see [`Note::from_content`] for the
+    /// thread-local variant.
+    pub fn from_content_with_kind(kind: HashKind, content: &str) -> Result<Self, GitError> {
+        Self::new_with_kind(kind, ObjectHash::zero_for_kind(kind), content.to_string())
+    }
+
     /// # Returns
     /// A new Note instance with calculated ID based on the content
+    ///
+    /// Uses the thread-local [`HashKind`]; see [`Note::new_with_kind`].
     pub fn new(target_object_id: ObjectHash, content: String) -> Self {
         // Calculate the SHA-1/ SHA-256 hash for this Note's content
         // Notes are stored as Blob objects in Git
@@ -87,6 +118,10 @@ impl Note {
     ///
     /// # Returns
     /// A new Note instance with default target object ID
+    ///
+    /// The default target is the SHA-1 zero ID regardless of the thread-local
+    /// kind (legacy behaviour); see [`Note::from_content_with_kind`] for a
+    /// kind-correct placeholder.
     pub fn from_content(content: &str) -> Self {
         Self::new(ObjectHash::default(), content.to_string())
     }

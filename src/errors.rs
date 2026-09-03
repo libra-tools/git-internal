@@ -186,3 +186,12 @@ pub enum GitError {
     #[error("{0}")]
     CustomError(String),
 }
+
+impl From<crate::hash::HashError> for GitError {
+    /// Explicit-kind hash failures (length / hex / kind mismatch, unsupported
+    /// object type, short stream) surface as [`GitError::InvalidHashValue`],
+    /// keeping the full diagnostic text of the [`crate::hash::HashError`].
+    fn from(err: crate::hash::HashError) -> Self {
+        GitError::InvalidHashValue(err.to_string())
+    }
+}

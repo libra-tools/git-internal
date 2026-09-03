@@ -17,7 +17,7 @@ use bstr::ByteSlice;
 
 use crate::{
     errors::GitError,
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash},
     internal::object::{ObjectTrait, ObjectType, signature::Signature},
 };
 
@@ -68,6 +68,54 @@ impl Display for Commit {
 }
 
 impl Commit {
+    /// Create a commit and derive its ID with an explicit repository `kind`.
+    ///
+    /// Does not consult the thread-local [`HashKind`]. `tree_id` and every
+    /// parent ID must belong to `kind`; a cross-kind reference fails closed
+    /// with [`GitError::InvalidHashValue`]. Never panics.
+    pub fn new_with_kind(
+        kind: HashKind,
+        author: Signature,
+        committer: Signature,
+        tree_id: ObjectHash,
+        parent_commit_ids: Vec<ObjectHash>,
+        message: &str,
+    ) -> Result<Commit, GitError> {
+        tree_id.ensure_kind(kind)?;
+        for parent in &parent_commit_ids {
+            parent.ensure_kind(kind)?;
+        }
+        let mut commit = Commit {
+            id: ObjectHash::zero_for_kind(kind),
+            tree_id,
+            parent_commit_ids,
+            author,
+            committer,
+            message: message.to_string(),
+        };
+        let data = commit.to_data()?;
+        commit.id = ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Commit, &data)?;
+        Ok(commit)
+    }
+
+    /// Convenience variant of [`Commit::new_with_kind`] that generates author and
+    /// committer signatures from the current time (see [`Commit::from_tree_id`]).
+    pub fn from_tree_id_with_kind(
+        kind: HashKind,
+        tree_id: ObjectHash,
+        parent_commit_ids: Vec<ObjectHash>,
+        message: &str,
+    ) -> Result<Commit, GitError> {
+        let now = chrono::Utc::now().timestamp();
+        let author =
+            Signature::from_data(format!("author mega <admin@mega.org> {now} +0800").into_bytes())?;
+        let committer = Signature::from_data(
+            format!("committer mega <admin@mega.org> {now} +0800").into_bytes(),
+        )?;
+        Commit::new_with_kind(kind, author, committer, tree_id, parent_commit_ids, message)
+    }
+
+    /// Create a commit using the thread-local [`HashKind`]; see [`Commit::new_with_kind`].
     pub fn new(
         author: Signature,
         committer: Signature,
@@ -101,6 +149,7 @@ impl Commit {
     /// # Returns
     /// A new `Commit` object with the specified tree ID, parent commit IDs, and commit message.
     /// The author and committer signatures are generated using the current time and a fixed email address.
+    /// Uses the thread-local [`HashKind`]; see [`Commit::from_tree_id_with_kind`].
     pub fn from_tree_id(
         tree_id: ObjectHash,
         parent_commit_ids: Vec<ObjectHash>,

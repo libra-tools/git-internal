@@ -5,7 +5,12 @@ use std::{io, io::BufRead};
 
 use flate2::{Decompress, FlushDecompress, Status};
 
-use crate::{internal::object::types::ObjectType, utils::HashAlgorithm};
+use crate::{
+    errors::GitError,
+    hash::{HashError, HashKind, get_hash_kind},
+    internal::object::types::ObjectType,
+    utils::HashAlgorithm,
+};
 
 /// ReadBoxed is to unzip information from a  DEFLATE stream,
 /// which hash [`BufRead`] trait.
@@ -27,16 +32,9 @@ impl<R> ReadBoxed<R>
 where
     R: BufRead,
 {
-    /// New a ReadBoxed for zlib read, the Output ReadBoxed is for the Common Object,
-    /// but not for the Delta Object,if that ,see new_for_delta method below.
-    pub fn new(inner: R, obj_type: ObjectType, size: usize) -> Self {
-        // Initialize the hash with the object header.
-        let mut hash = HashAlgorithm::new();
-        hash.update(
-            obj_type
-                .to_bytes()
-                .expect("ReadBoxed::new called with a delta type"),
-        );
+    /// Seed `hash` with the loose-object header `<type> <size>\0` and build the reader.
+    fn with_header(inner: R, mut hash: HashAlgorithm, type_bytes: &[u8], size: usize) -> Self {
+        hash.update(type_bytes);
         hash.update(b" ");
         hash.update(size.to_string().as_bytes());
         hash.update(b"\0");
@@ -48,15 +46,76 @@ where
         }
     }
 
-    /// New a ReadBoxed for zlib read, the Output ReadBoxed is for the Delta Object,
-    /// which does not need to calculate the hash value.
-    pub fn new_for_delta(inner: R) -> Self {
+    /// New a ReadBoxed for a common (non-delta) object whose ID must be computed
+    /// with an explicit repository `kind`.
+    ///
+    /// Does not consult the thread-local [`HashKind`]. Delta object types have no
+    /// loose-object header and are rejected with
+    /// [`HashError::UnsupportedObjectType`] (carrying the operation, `kind`,
+    /// the expected digest width and the offered payload size) wrapped in
+    /// [`GitError::InvalidHashValue`].
+    pub fn new_with_kind(
+        inner: R,
+        obj_type: ObjectType,
+        size: usize,
+        kind: HashKind,
+    ) -> Result<Self, GitError> {
+        let type_bytes = obj_type
+            .to_bytes()
+            .ok_or(HashError::UnsupportedObjectType {
+                operation: "ReadBoxed::new_with_kind",
+                kind,
+                object_type: obj_type,
+                expected: kind.size(),
+                actual: 0,
+                payload_len: size,
+            })?;
+        Ok(Self::with_header(
+            inner,
+            HashAlgorithm::new_for_kind(kind),
+            type_bytes,
+            size,
+        ))
+    }
+
+    /// New a ReadBoxed for zlib read, the Output ReadBoxed is for the Common Object,
+    /// but not for the Delta Object,if that ,see new_for_delta method below.
+    ///
+    /// Legacy entry point using the thread-local [`HashKind`]; keeps its
+    /// pre-existing panicking contract for delta types. Prefer
+    /// [`ReadBoxed::new_with_kind`].
+    pub fn new(inner: R, obj_type: ObjectType, size: usize) -> Self {
+        // Initialize the hash with the object header.
+        let hash = HashAlgorithm::new();
+        let type_bytes = obj_type
+            .to_bytes()
+            .expect("ReadBoxed::new called with a delta type");
+        Self::with_header(inner, hash, type_bytes, size)
+    }
+
+    /// New a ReadBoxed for a delta object with an explicit repository `kind`.
+    /// Delta payloads are not hashed, so the hasher is only carried for API symmetry.
+    pub fn new_for_delta_with_kind(inner: R, kind: HashKind) -> Self {
         ReadBoxed {
             inner,
-            hash: HashAlgorithm::new(),
+            hash: HashAlgorithm::new_for_kind(kind),
             count_hash: false,
             decompressor: Box::new(Decompress::new(true)),
         }
+    }
+
+    /// New a ReadBoxed for zlib read, the Output ReadBoxed is for the Delta Object,
+    /// which does not need to calculate the hash value.
+    ///
+    /// Compatibility wrapper around [`ReadBoxed::new_for_delta_with_kind`] using
+    /// the thread-local [`HashKind`].
+    pub fn new_for_delta(inner: R) -> Self {
+        Self::new_for_delta_with_kind(inner, get_hash_kind())
+    }
+
+    /// The [`HashKind`] this reader's hasher produces.
+    pub fn hash_kind(&self) -> HashKind {
+        self.hash.kind()
     }
 }
 impl<R> io::Read for ReadBoxed<R>
@@ -204,5 +263,49 @@ mod tests {
         assert_eq!(reader_hash.len(), 32);
         assert_eq!(expected.as_ref().len(), 32);
         assert_eq!(reader_hash.as_slice(), expected.as_ref());
+    }
+
+    /// `new_with_kind` hashes with the explicit kind regardless of the thread-local kind.
+    #[test]
+    fn inflate_object_new_with_kind_ignores_thread_local() {
+        for (kind, other) in [
+            (HashKind::Sha1, HashKind::Sha256),
+            (HashKind::Sha256, HashKind::Sha1),
+        ] {
+            let _guard = set_hash_kind_for_test(other);
+            let body = b"content";
+            let compressed = zlib_compress(body);
+
+            let mut reader = ReadBoxed::new_with_kind(
+                io::Cursor::new(&compressed),
+                ObjectType::Blob,
+                body.len(),
+                kind,
+            )
+            .unwrap();
+            assert_eq!(reader.hash_kind(), kind);
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).unwrap();
+            assert_eq!(out, body);
+
+            let expected =
+                ObjectHash::from_type_and_data_for_kind(kind, ObjectType::Blob, body).unwrap();
+            assert_eq!(reader.hash.finalize_object_hash(), expected);
+
+            // Legacy constructors follow the thread-local kind.
+            assert_eq!(
+                ReadBoxed::new(io::Cursor::new(&compressed), ObjectType::Blob, body.len())
+                    .hash_kind(),
+                other
+            );
+            assert_eq!(
+                ReadBoxed::new_for_delta(io::Cursor::new(&compressed)).hash_kind(),
+                other
+            );
+            assert_eq!(
+                ReadBoxed::new_for_delta_with_kind(io::Cursor::new(&compressed), kind).hash_kind(),
+                kind
+            );
+        }
     }
 }
