@@ -418,7 +418,7 @@ impl _Cache for Caches {
 
 #[cfg(test)]
 mod test {
-    use std::{env, sync::Arc, thread};
+    use std::{sync::Arc, thread};
 
     use super::*;
     use crate::{
@@ -442,28 +442,15 @@ mod test {
     /// test single-threaded cache behavior with different hash kinds and capacities
     #[test]
     fn test_cache_single_thread() {
-        for (kind, cap, size_ab, size_c, tmp_dir) in [
-            (
-                HashKind::Sha1,
-                2048usize,
-                800usize,
-                1700usize,
-                "tests/.cache_tmp",
-            ),
-            (
-                HashKind::Sha256,
-                4096usize,
-                1500usize,
-                3000usize,
-                "tests/.cache_tmp_sha256",
-            ),
+        for (kind, cap, size_ab, size_c) in [
+            (HashKind::Sha1, 2048usize, 800usize, 1700usize),
+            (HashKind::Sha256, 4096usize, 1500usize, 3000usize),
         ] {
             let _guard = set_hash_kind_for_test(kind);
-            let source = PathBuf::from(env::current_dir().unwrap().parent().unwrap());
-            let tmp_path = source.clone().join(tmp_dir);
-            if tmp_path.exists() {
-                fs::remove_dir_all(&tmp_path).unwrap();
-            }
+            // A private temp dir (honours TMPDIR) instead of a repo-relative path, so the
+            // test is isolated and runs in read-only checkouts (GC-11).
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let tmp_path = tmp_dir.path().join("cache");
 
             let cache = Caches::new(Some(cap), tmp_path, 1);
             let a_hash = ObjectHash::new(String::from("a").as_bytes());
@@ -491,17 +478,19 @@ mod test {
             assert!(cache.try_get(b_hash).is_none());
             assert!(cache.try_get(c_hash).is_some());
             assert!(cache.get_by_hash(c_hash).is_some());
+
+            // Join the spill workers before the temp dir goes away, then prove the cleanup:
+            // `close` fails if anything is still being written into the directory.
+            cache.shutdown();
+            tmp_dir.close().unwrap();
         }
     }
 
     /// consider the multi-threaded scenario where different threads use different hash kinds
     #[test]
     fn test_cache_multi_thread_mixed_hash_kinds() {
-        let base = PathBuf::from(env::current_dir().unwrap().parent().unwrap());
-        let tmp_path = base.join("tests/.cache_tmp_mixed");
-        if tmp_path.exists() {
-            fs::remove_dir_all(&tmp_path).unwrap();
-        }
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().join("cache");
 
         let cache = Arc::new(Caches::new(Some(4096), tmp_path, 2));
 
@@ -545,6 +534,8 @@ mod test {
         handle_sha256.join().unwrap();
 
         assert_eq!(cache.total_inserted(), 2);
+        cache.shutdown();
+        tmp_dir.close().unwrap();
     }
 
     #[test]
@@ -567,8 +558,8 @@ mod test {
     #[test]
     fn test_unbounded_cache_skips_hash_set_index() {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
-        let base = PathBuf::from(env::current_dir().unwrap().parent().unwrap());
-        let tmp_path = base.join("tests/.cache_tmp_unbounded");
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().join("cache");
         let cache = Caches::new(None, tmp_path, 1);
         let hash = ObjectHash::new(b"unbounded-entry");
         let obj = make_obj(64, hash);
@@ -588,16 +579,15 @@ mod test {
         );
         assert!(cache.get_by_offset(0).is_some());
         assert!(cache.memory_used_index() > 0);
+        cache.shutdown();
+        tmp_dir.close().unwrap();
     }
 
     #[test]
     fn test_bounded_cache_tracks_resident_entries() {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
-        let base = PathBuf::from(env::current_dir().unwrap().parent().unwrap());
-        let tmp_path = base.join("tests/.cache_tmp_resident");
-        if tmp_path.exists() {
-            fs::remove_dir_all(&tmp_path).unwrap();
-        }
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().join("cache");
 
         let cache = Caches::new(Some(2048), tmp_path, 1);
         let a_hash = ObjectHash::new(b"resident-a");
@@ -614,6 +604,8 @@ mod test {
         assert!(cache.hash_set.contains(&b_hash));
         assert!(!cache.resident_hash_set.contains(&a_hash));
         assert!(cache.resident_hash_set.contains(&b_hash));
+        cache.shutdown();
+        tmp_dir.close().unwrap();
     }
 
     /// Regression test for the ABBA lock-order inversion between the `lru_cache`
