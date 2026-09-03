@@ -13,8 +13,8 @@ API and fully cross-verified pack/idx/protocol integrity. This is a `0.x`
 
 ### Added
 
-- `HashKind::Blake3`, `ObjectHash::Blake3` and `HashAlgorithm::Blake3`
-  (32 bytes / 64 hex, `as_str() == "blake3"`, `is_git_standard() == false`).
+- `HashKind::Blake3` (`as_str() == "blake3"`, `is_git_standard() == false`),
+  `ObjectHash::Blake3` and `HashAlgorithm::Blake3` (32-byte / 64-hex digests).
   BLAKE3 is a separate object namespace that is never inferred from an ID's
   width: the explicit-kind API and `blake3:HEX` tags name it directly, and the
   thread-local constructors (`ObjectHash::new`, `from_bytes`, …) produce it
@@ -24,8 +24,9 @@ API and fully cross-verified pack/idx/protocol integrity. This is a `0.x`
   `ObjectHash::{from_hex_for_kind, from_bytes_for_kind, from_stream_for_kind,
   new_for_kind, from_type_and_data_for_kind, zero_for_kind, ensure_kind,
   to_tagged_string, from_tagged_str}`, `HashAlgorithm::new_for_kind`,
-  `HashError` (operation / kind / expected / actual), `From<HashError>` for
-  `GitError` and `io::Error`.
+  `HashError` (every variant names the failing operation and carries its own
+  expected/actual diagnostics; `UnknownKind` reports the accepted tags),
+  `From<HashError>` for `GitError` and `io::Error`.
 - Object model: `Blob::from_content_with_kind`, `Tree::from_tree_items_with_kind`
   / `rehash_with_kind`, `TreeItem::from_bytes_with_kind`, `Commit::new_with_kind` /
   `from_tree_id_with_kind`, `Tag::new_with_kind`, `Note::new_with_kind` /
@@ -98,8 +99,9 @@ API and fully cross-verified pack/idx/protocol integrity. This is a `0.x`
 - `HashKind`, `ObjectHash` and `HashAlgorithm` gained a `Blake3` variant and are
   not `#[non_exhaustive]`: exhaustive `match` expressions in downstream crates
   will fail to compile until a `Blake3` arm is added.
-- `ObjectHash::from_str` (and `from_bytes_infer_kind`) infer the algorithm from
-  the width and therefore return `Sha256` for a BLAKE3 64-hex ID; parse IDs
+- `ObjectHash::from_str` infers the algorithm from the hex width and therefore
+  returns `Sha256` for a BLAKE3 64-hex ID (`from_bytes_infer_kind` does the
+  same for a raw 32-byte BLAKE3 digest); parse IDs
   with `from_hex_for_kind(repository_kind, …)` at every boundary that may serve
   more than one repository. Where a boundary accepts tagged IDs, follow
   `from_tagged_str` with `ensure_kind(repository_kind)`: the tag names the ID's
