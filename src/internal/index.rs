@@ -19,7 +19,7 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::{
     errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash, get_hash_kind},
     internal::pack::wrapper::Wrapper,
     utils::{self, HashAlgorithm},
 };
@@ -300,10 +300,22 @@ impl Index {
         self.entries.len()
     }
 
+    /// Read an index file using the thread-local [`HashKind`]; compatibility wrapper around
+    /// [`Index::from_file_with_hash_kind`].
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, GitError> {
+        Self::from_file_with_hash_kind(get_hash_kind(), path)
+    }
+
+    /// Read an index file whose entry IDs and checksum belong to the explicit repository
+    /// `kind`. The checksum is verified with `kind`, so an index written for another kind
+    /// (even one of the same width) fails closed instead of being misread.
+    pub fn from_file_with_hash_kind(
+        kind: HashKind,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, GitError> {
         let file = File::open(path.as_ref())?; // read-only
         let total_size = file.metadata()?.len();
-        let file = &mut Wrapper::new(BufReader::new(file)); // TODO move Wrapper & utils to a common module
+        let file = &mut Wrapper::new_with_kind(BufReader::new(file), kind); // TODO move Wrapper & utils to a common module
 
         let num = Index::check_header(file)?;
         let mut index = Index::new();
@@ -318,7 +330,7 @@ impl Index {
                 uid: file.read_u32::<BigEndian>()?,
                 gid: file.read_u32::<BigEndian>()?,
                 size: file.read_u32::<BigEndian>()?,
-                hash: utils::read_sha(file)?,
+                hash: utils::read_sha_for_kind(kind, file)?,
                 flags: Flags::from(file.read_u16::<BigEndian>()?),
                 name: String::new(),
             };
@@ -334,15 +346,15 @@ impl Index {
 
             // 1-8 nul bytes as necessary to pad the entry to a multiple of eight bytes
             // while keeping the name NUL-terminated.
-            let hash_len = get_hash_kind().size();
+            let hash_len = kind.size();
             let entry_len = hash_len + 2 + name_len;
             let padding = 1 + ((8 - ((entry_len + 1) % 8)) % 8); // at least 1 byte nul
             utils::read_bytes(file, padding)?;
         }
 
         // Extensions
-        while file.bytes_read() + get_hash_kind().size() < total_size as usize {
-            // The remaining bytes must be the pack checksum (size = get_hash_kind().size())
+        while file.bytes_read() + kind.size() < total_size as usize {
+            // The remaining bytes must be the index checksum (size = kind.size())
             let sign = utils::read_bytes(file, 4)?;
             println!(
                 "{:?}",
@@ -364,7 +376,7 @@ impl Index {
 
         // check sum
         let file_hash = file.final_hash();
-        let check_sum = utils::read_sha(file)?;
+        let check_sum = utils::read_sha_for_kind(kind, file)?;
         if file_hash != check_sum {
             return Err(GitError::InvalidIndexFile("Check sum failed".to_string()));
         }
@@ -372,9 +384,26 @@ impl Index {
         Ok(index)
     }
 
+    /// Write the index using the thread-local [`HashKind`]; compatibility wrapper around
+    /// [`Index::to_file_with_hash_kind`].
     pub fn to_file(&self, path: impl AsRef<Path>) -> Result<(), GitError> {
+        self.to_file_with_hash_kind(get_hash_kind(), path)
+    }
+
+    /// Write the index for an explicit repository `kind`: every entry ID must belong to
+    /// `kind` (a cross-kind entry fails closed) and the trailing checksum is computed with it.
+    pub fn to_file_with_hash_kind(
+        &self,
+        kind: HashKind,
+        path: impl AsRef<Path>,
+    ) -> Result<(), GitError> {
+        // Validate every entry before touching the destination, so a cross-kind entry can
+        // neither truncate an existing valid index nor leave a partial file behind.
+        for entry in self.entries.values() {
+            entry.hash.ensure_kind(kind)?;
+        }
         let mut file = File::create(path)?;
-        let mut hash = HashAlgorithm::new();
+        let mut hash = HashAlgorithm::new_for_kind(kind);
 
         let mut header = Vec::new();
         header.write_all(b"DIRC")?;
@@ -398,7 +427,7 @@ impl Index {
             entry_bytes.write_all(entry.hash.as_ref())?;
             entry_bytes.write_u16::<BigEndian>((&entry.flags).try_into().unwrap())?;
             entry_bytes.write_all(entry.name.as_bytes())?;
-            let hash_len = get_hash_kind().size();
+            let hash_len = kind.size();
             let entry_len = hash_len + 2 + entry.name.len();
             let padding = 1 + ((8 - ((entry_len + 1) % 8)) % 8); // at least 1 byte nul
             entry_bytes.write_all(&vec![0; padding])?;
@@ -409,30 +438,46 @@ impl Index {
         // Extensions
 
         // check sum
-        let file_hash =
-            ObjectHash::from_bytes(&hash.finalize()).map_err(GitError::InvalidIndexFile)?;
+        let file_hash = hash.finalize_object_hash();
         file.write_all(file_hash.as_ref())?;
         Ok(())
     }
 
+    /// Refresh one entry using the thread-local [`HashKind`]; compatibility wrapper around
+    /// [`Index::refresh_with_hash_kind`].
     pub fn refresh(&mut self, file: impl AsRef<Path>, workdir: &Path) -> Result<bool, GitError> {
+        self.refresh_with_hash_kind(get_hash_kind(), file, workdir)
+    }
+
+    /// Refresh one entry's stat data and content hash for an explicit repository `kind`.
+    ///
+    /// The existing entry must already belong to `kind`: refreshing an entry of another kind
+    /// fails closed instead of silently replacing its ID with a digest of a different
+    /// algorithm.
+    pub fn refresh_with_hash_kind(
+        &mut self,
+        kind: HashKind,
+        file: impl AsRef<Path>,
+        workdir: &Path,
+    ) -> Result<bool, GitError> {
         let path = file.as_ref();
         let name = path
             .to_str()
             .ok_or(GitError::InvalidPathError(format!("{path:?}")))?;
 
         if let Some(entry) = self.entries.get_mut(&(name.to_string(), 0)) {
+            entry.hash.ensure_kind(kind)?;
             let abs_path = workdir.join(path);
             let meta = fs::symlink_metadata(&abs_path)?;
             let new_ctime = Time::from_system_time(index_ctime(&meta));
             let new_mtime = Time::from_system_time(index_mtime(&meta));
             let new_size = meta.len() as u32;
 
-            // re-calculate SHA1/SHA256
+            // re-calculate the content hash with the repository kind
             let mut file = File::open(&abs_path)?;
-            let mut hasher = HashAlgorithm::new();
+            let mut hasher = HashAlgorithm::new_for_kind(kind);
             io::copy(&mut file, &mut hasher)?;
-            let new_hash = ObjectHash::from_bytes(&hasher.finalize()).unwrap();
+            let new_hash = hasher.finalize_object_hash();
 
             // refresh index
             if entry.ctime != new_ctime
@@ -459,12 +504,22 @@ impl Default for Index {
 
 impl Index {
     /// Load index. If it does not exist, return an empty index.
+    ///
+    /// Uses the thread-local [`HashKind`]; see [`Index::load_with_hash_kind`].
     pub fn load(index_file: impl AsRef<Path>) -> Result<Self, GitError> {
+        Self::load_with_hash_kind(get_hash_kind(), index_file)
+    }
+
+    /// Load index for an explicit repository `kind`. If it does not exist, return an empty index.
+    pub fn load_with_hash_kind(
+        kind: HashKind,
+        index_file: impl AsRef<Path>,
+    ) -> Result<Self, GitError> {
         let path = index_file.as_ref();
         if !path.exists() {
             return Ok(Index::new());
         }
-        Index::from_file(path)
+        Index::from_file_with_hash_kind(kind, path)
     }
 
     pub fn update(&mut self, entry: IndexEntry) {
@@ -562,9 +617,18 @@ impl Index {
         removed
     }
 
-    /// saved to index file
+    /// saved to index file (thread-local [`HashKind`]; see [`Index::save_with_hash_kind`])
     pub fn save(&self, index_file: impl AsRef<Path>) -> Result<(), GitError> {
         self.to_file(index_file)
+    }
+
+    /// Save to an index file for an explicit repository `kind`.
+    pub fn save_with_hash_kind(
+        &self,
+        kind: HashKind,
+        index_file: impl AsRef<Path>,
+    ) -> Result<(), GitError> {
+        self.to_file_with_hash_kind(kind, index_file)
     }
 }
 
@@ -746,5 +810,99 @@ mod tests {
         let workdir = Path::new("../");
         let entry = IndexEntry::new_from_file(file, hash, workdir).unwrap();
         println!("{entry}");
+    }
+
+    /// A BLAKE3 index round-trips through `to_file_with_hash_kind` / `from_file_with_hash_kind`
+    /// with the thread-local kind set to SHA-1, entry lookups return `ObjectHash::Blake3`, and
+    /// reading the file as SHA-256 (same width) or writing a cross-kind entry fails closed.
+    #[test]
+    fn blake3_lookup() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("index-blake3");
+
+        let a = ObjectHash::new_for_kind(HashKind::Blake3, b"a");
+        let c = ObjectHash::new_for_kind(HashKind::Blake3, b"c");
+        let mut index = Index::new();
+        index.add(IndexEntry::new_from_blob("a.txt".to_string(), a, 1));
+        index.add(IndexEntry::new_from_blob("b/c.txt".to_string(), c, 3));
+        index
+            .to_file_with_hash_kind(HashKind::Blake3, &path)
+            .unwrap();
+
+        let loaded = Index::from_file_with_hash_kind(HashKind::Blake3, &path).unwrap();
+        assert_eq!(loaded.size(), 2);
+        let got = loaded.get("a.txt", 0).expect("a.txt");
+        assert_eq!(got.hash, a);
+        assert_eq!(got.hash.kind(), HashKind::Blake3);
+        assert_eq!(loaded.get("b/c.txt", 0).unwrap().hash, c);
+        assert_eq!(
+            loaded.tracked_files(),
+            vec![PathBuf::from("a.txt"), PathBuf::from("b/c.txt")]
+        );
+
+        // Same width, different algorithm: the checksum does not verify.
+        let err = Index::from_file_with_hash_kind(HashKind::Sha256, &path)
+            .err()
+            .expect("same-width SHA-256 read must fail");
+        assert!(matches!(err, GitError::InvalidIndexFile(_)), "{err:?}");
+        // The thread-local (SHA-1) legacy reader cannot read a BLAKE3 index either.
+        assert!(Index::from_file(&path).is_err());
+
+        // load/save with explicit kind.
+        let missing =
+            Index::load_with_hash_kind(HashKind::Blake3, temp_dir.path().join("none")).unwrap();
+        assert_eq!(missing.size(), 0);
+        let again = temp_dir.path().join("index-blake3-2");
+        loaded
+            .save_with_hash_kind(HashKind::Blake3, &again)
+            .unwrap();
+        assert_eq!(
+            Index::load_with_hash_kind(HashKind::Blake3, &again)
+                .unwrap()
+                .size(),
+            2
+        );
+
+        // A cross-kind entry is refused when writing.
+        let mut mixed = Index::new();
+        mixed.add(IndexEntry::new_from_blob(
+            "x.txt".to_string(),
+            ObjectHash::new_for_kind(HashKind::Sha256, b"x"),
+            1,
+        ));
+        let mixed_path = temp_dir.path().join("mixed");
+        let err = mixed
+            .to_file_with_hash_kind(HashKind::Blake3, &mixed_path)
+            .expect_err("cross-kind entry must fail");
+        assert!(matches!(err, GitError::InvalidHashValue(_)), "{err:?}");
+        // ... and the destination is untouched: no partial file, and an existing valid index
+        // is not truncated.
+        assert!(!mixed_path.exists());
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            mixed
+                .to_file_with_hash_kind(HashKind::Blake3, &path)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // Refreshing a BLAKE3 entry with another kind is refused and leaves it untouched;
+        // the same kind recomputes a BLAKE3 content hash.
+        let work = temp_dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("a.txt"), b"a").unwrap();
+        let mut refreshed = Index::from_file_with_hash_kind(HashKind::Blake3, &path).unwrap();
+        let err = refreshed
+            .refresh_with_hash_kind(HashKind::Sha256, "a.txt", &work)
+            .expect_err("cross-kind refresh must fail");
+        assert!(matches!(err, GitError::InvalidHashValue(_)), "{err:?}");
+        assert_eq!(refreshed.get("a.txt", 0).unwrap().hash, a);
+        refreshed
+            .refresh_with_hash_kind(HashKind::Blake3, "a.txt", &work)
+            .unwrap();
+        let got = refreshed.get("a.txt", 0).unwrap().hash;
+        assert_eq!(got.kind(), HashKind::Blake3);
+        assert_eq!(got, a);
     }
 }

@@ -27,7 +27,8 @@ use tempfile::NamedTempFile;
 use threadpool::ThreadPool;
 
 use crate::{
-    hash::ObjectHash,
+    errors::GitError,
+    hash::{HashKind, ObjectHash},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::types::ObjectType,
@@ -293,7 +294,30 @@ impl MemSizeRecorder for CacheObject {
 }
 
 impl CacheObject {
+    /// Create a new base CacheObject whose ID is computed with an explicit repository
+    /// `kind` (never the thread-local); fails closed for delta types.
+    pub fn new_for_undeltified_with_kind(
+        kind: HashKind,
+        obj_type: ObjectType,
+        data: Vec<u8>,
+        offset: usize,
+        crc32: u32,
+    ) -> Result<Self, GitError> {
+        let hash = utils::calculate_object_hash_for_kind(kind, obj_type, &data)?;
+        Ok(CacheObject {
+            info: CacheObjectInfo::BaseObject(obj_type, hash),
+            offset,
+            crc32,
+            data_decompressed: data,
+            mem_recorder: None,
+            is_delta_in_pack: false,
+            known_hash: None,
+        })
+    }
+
     /// Create a new CacheObject which is neither [`ObjectType::OffsetDelta`] nor [`ObjectType::HashDelta`].
+    ///
+    /// Uses the thread-local [`HashKind`]; see [`CacheObject::new_for_undeltified_with_kind`].
     pub fn new_for_undeltified(
         obj_type: ObjectType,
         data: Vec<u8>,

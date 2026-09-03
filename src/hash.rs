@@ -589,6 +589,11 @@ impl ObjectHash {
     /// task; the checksum bytes already carry the correct length, while the
     /// worker's thread-local may still hold the default SHA-1 kind — the
     /// mismatch used to panic with "Invalid byte length: got 32, expected 20".
+    #[deprecated(
+        since = "0.9.0",
+        note = "infers SHA-256 from a 32-byte length and can never represent BLAKE3; use \
+                ObjectHash::from_bytes_for_kind or HashAlgorithm::finalize_object_hash"
+    )]
     pub fn from_bytes_infer_kind(bytes: &[u8]) -> Result<ObjectHash, String> {
         match bytes.len() {
             20 => {
@@ -1230,6 +1235,7 @@ mod tests {
     /// The legacy length-inferring parsers keep their frozen contract regardless of the
     /// thread-local kind: 40 hex / 20 bytes → SHA-1, 64 hex / 32 bytes → SHA-256.
     #[test]
+    #[allow(deprecated)]
     fn object_hash_for_kind_legacy_parsers_unchanged() {
         for other in [HashKind::Sha1, HashKind::Sha256] {
             let _guard = set_hash_kind_for_test(other);
@@ -1427,6 +1433,7 @@ mod tests {
     /// BLAKE3 IDs are only produced under an explicit kind or a `blake3:` tag; a 64-hex /
     /// 32-byte value is never guessed to be BLAKE3, and SHA-256/BLAKE3 never alias.
     #[test]
+    #[allow(deprecated)]
     fn blake3_context_and_tagged_id() {
         let _guard = set_hash_kind_for_test(HashKind::Sha256);
         let digest = ObjectHash::new_for_kind(HashKind::Blake3, b"payload");

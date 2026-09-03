@@ -22,9 +22,11 @@ use crate::{
 };
 
 /// Cache format version appended to the disk path so that caches written with an
-/// incompatible serialization format (for example the previous bincode layout)
-/// are ignored instead of causing deserialization errors.
-const CACHE_LAYOUT_VERSION: &str = "rkyv-v1";
+/// incompatible serialization format (for example the previous bincode layout, or the
+/// `rkyv-v1` layout whose spill file names were untagged hex and could therefore alias a
+/// SHA-256 and a BLAKE3 object with identical bytes) are ignored instead of causing
+/// deserialization errors or cross-kind reads.
+const CACHE_LAYOUT_VERSION: &str = "rkyv-v2";
 
 /// Trait defining the interface for a multi-tier cache system.
 /// This cache supports insertion and retrieval of objects by both offset and hash,
@@ -130,14 +132,21 @@ impl Caches {
         Ok(obj)
     }
 
-    /// generate the temp file path, hex string of the hash
+    /// generate the temp file path: `<tmp>/<layout>/<2 hex>/<kind>-<hex>`.
+    ///
+    /// The file name carries the hash kind (ADR-GI-B3-05): SHA-256 and BLAKE3 IDs print as
+    /// the same 64 hex characters, so an untagged name would let one kind read the other's
+    /// spilled object. The two-character subdirectory keeps the per-first-byte `Once`
+    /// directory creation shared across kinds.
     fn generate_temp_path(&self, tmp_path: &Path, hash: ObjectHash) -> PathBuf {
-        // Reserve capacity for base path, 2-char subdir, hex hash string, and separators
-        let mut path =
-            PathBuf::with_capacity(self.tmp_path.capacity() + hash.to_string().len() + 5);
+        let kind = hash.kind().as_str();
+        let hash_str = hash._to_string();
+        // Reserve capacity for base path, layout, 2-char subdir, kind tag, hex hash and separators
+        let mut path = PathBuf::with_capacity(
+            self.tmp_path.capacity() + CACHE_LAYOUT_VERSION.len() + kind.len() + hash_str.len() + 8,
+        );
         path.push(tmp_path);
         path.push(CACHE_LAYOUT_VERSION);
-        let hash_str = hash._to_string();
         path.push(&hash_str[..2]); // use first 2 chars as the directory
         self.path_prefixes[hash.as_ref()[0] as usize].call_once(|| {
             // Check if the directory exists, if not, create it
@@ -145,7 +154,7 @@ impl Caches {
                 fs::create_dir_all(&path).unwrap();
             }
         });
-        path.push(hash_str);
+        path.push(format!("{kind}-{hash_str}"));
         path
     }
 
@@ -717,5 +726,71 @@ mod test {
         // f_save tasks don't race with cleanup.
         cache.clear();
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Spill files are namespaced by hash kind: a SHA-256 and a BLAKE3 object with identical
+    /// 32 bytes never share a path, and each is read back with its own data after eviction.
+    #[test]
+    fn blake3_spill_namespace() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_path = tmp.path().join("spill");
+        let cache = Caches::new(Some(1024), tmp_path.clone(), 1);
+
+        let sha256_hash = ObjectHash::Sha256([0x42; 32]);
+        let blake3_hash = ObjectHash::Blake3([0x42; 32]);
+        assert_eq!(sha256_hash.to_string(), blake3_hash.to_string());
+        assert_ne!(sha256_hash, blake3_hash);
+
+        let sha256_path = cache.generate_temp_path(&tmp_path, sha256_hash);
+        let blake3_path = cache.generate_temp_path(&tmp_path, blake3_hash);
+        assert_ne!(sha256_path, blake3_path);
+        assert!(
+            sha256_path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("sha256-")
+        );
+        assert!(
+            blake3_path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("blake3-")
+        );
+        assert_eq!(sha256_path.parent(), blake3_path.parent());
+        assert!(sha256_path.to_str().unwrap().contains(CACHE_LAYOUT_VERSION));
+
+        let mut sha256_obj = make_obj(700, sha256_hash);
+        sha256_obj.data_decompressed = vec![1; 700];
+        sha256_obj.offset = 1;
+        let mut blake3_obj = make_obj(800, blake3_hash);
+        blake3_obj.data_decompressed = vec![2; 800];
+        blake3_obj.offset = 2;
+        let mut third = make_obj(900, ObjectHash::Blake3([0x99; 32]));
+        third.offset = 3;
+
+        cache.insert(1, sha256_hash, sha256_obj);
+        cache.insert(2, blake3_hash, blake3_obj); // evicts the SHA-256 object to disk
+        cache.insert(3, ObjectHash::Blake3([0x99; 32]), third); // evicts the BLAKE3 object to disk
+        assert!(cache.hash_set.contains(&sha256_hash));
+        assert!(cache.hash_set.contains(&blake3_hash));
+
+        let back_sha256 = cache
+            .get_by_hash(sha256_hash)
+            .expect("spilled sha256 object");
+        assert_eq!(back_sha256.data_decompressed, vec![1; 700]);
+        assert_eq!(back_sha256.base_object_hash(), Some(sha256_hash));
+        let back_blake3 = cache
+            .get_by_hash(blake3_hash)
+            .expect("spilled blake3 object");
+        assert_eq!(back_blake3.data_decompressed, vec![2; 800]);
+        assert_eq!(back_blake3.base_object_hash(), Some(blake3_hash));
+        assert_eq!(cache.get_hash(1), Some(sha256_hash));
+        assert_eq!(cache.get_hash(2), Some(blake3_hash));
+        assert!(sha256_path.exists() && blake3_path.exists());
     }
 }

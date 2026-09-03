@@ -5,7 +5,7 @@
 //! channel while the caller-facing task performs encoding. After the pack is finalized and
 //! renamed, a second writer drains the generated index bytes.
 
-use std::path::PathBuf;
+use std::{future::Future, path::PathBuf};
 
 use chrono::Utc;
 use tokio::{fs::File, io::AsyncWriteExt as TokioAsyncWriteExt, sync::mpsc};
@@ -13,6 +13,7 @@ use tokio::{fs::File, io::AsyncWriteExt as TokioAsyncWriteExt, sync::mpsc};
 use super::PackEncoder;
 use crate::{
     errors::GitError,
+    hash::{HashKind, get_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         pack::entry::Entry,
@@ -29,7 +30,29 @@ use crate::{
 /// `object_number` must equal the number of entries eventually received. A `window_size` of zero
 /// disables delta compression; any non-zero value selects the delta-search path. The default build
 /// uses Rabin fingerprinting; builds without `diff_rabin` use Myers or Patience.
-pub async fn encode_and_output_to_files(
+pub fn encode_and_output_to_files(
+    raw_entries_rx: mpsc::Receiver<MetaAttached<Entry, EntryMeta>>,
+    object_number: usize,
+    output_dir: PathBuf,
+    window_size: usize,
+) -> impl Future<Output = Result<(), GitError>> + Send {
+    // Capture the thread-local kind on the *calling* thread, before the future is first
+    // polled on some Tokio worker whose thread-local may belong to another repository.
+    let hash_kind = get_hash_kind();
+    encode_and_output_to_files_with_hash_kind(
+        hash_kind,
+        raw_entries_rx,
+        object_number,
+        output_dir,
+        window_size,
+    )
+}
+
+/// Like [`encode_and_output_to_files`], but for an explicit repository `hash_kind` (pack
+/// checksum, `pack-<checksum>` file names, ref-delta base IDs and idx object names all follow
+/// it). [`encode_and_output_to_files`] is the thread-local compatibility wrapper.
+pub async fn encode_and_output_to_files_with_hash_kind(
+    hash_kind: HashKind,
     raw_entries_rx: mpsc::Receiver<MetaAttached<Entry, EntryMeta>>,
     object_number: usize,
     output_dir: PathBuf,
@@ -37,7 +60,13 @@ pub async fn encode_and_output_to_files(
 ) -> Result<(), GitError> {
     let (pack_tx, mut pack_rx) = mpsc::channel(1024);
     let (idx_tx, mut idx_rx) = mpsc::channel(1024);
-    let mut pack_encoder = PackEncoder::new_with_idx(object_number, window_size, pack_tx, idx_tx);
+    let mut pack_encoder = PackEncoder::new_with_idx_and_hash_kind(
+        hash_kind,
+        object_number,
+        window_size,
+        pack_tx,
+        idx_tx,
+    );
 
     // The checksum-based final filename is unknown until the complete pack has been hashed.
     let now = Utc::now();

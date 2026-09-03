@@ -11,7 +11,12 @@ use super::{
 use crate::{
     hash::{HashKind, ObjectHash, set_hash_kind_for_test},
     internal::{
-        object::{blob::Blob, types::ObjectType},
+        object::{
+            blob::Blob,
+            commit::Commit,
+            tree::{Tree, TreeItem, TreeItemMode},
+            types::ObjectType,
+        },
         pack::{
             Pack,
             test_pack_download::{PackFileGuard, download_pack_file},
@@ -916,6 +921,18 @@ async fn test_pack_encoder_output_to_files() {
     );
     assert!(idx_file.metadata().unwrap().len() > 0, "idx file is empty");
 
+    // The generated pair must be accepted by this crate's own idx-backed decoder: object
+    // names, CRCs over the encoded entries, offsets and both checksums are all verified.
+    let mut pack = Pack::new(
+        Some(2),
+        Some(64 * 1024 * 1024),
+        Some(path.join("decode-tmp")),
+        true,
+    );
+    pack.decode_file_full_without_callback(&pack_file, None::<fn(ObjectHash)>)
+        .unwrap();
+    assert_eq!(pack.number, entries_number);
+
     let duration = start.elapsed();
     tracing::info!("test executed in: {:.2?}", duration);
     tracing::info!("original total size: {}", total_original_size);
@@ -981,6 +998,18 @@ async fn test_pack_encoder_output_to_files_with_delta() {
         "pack file is empty"
     );
     assert!(idx_file.metadata().unwrap().len() > 0, "idx file is empty");
+
+    // The generated pair must be accepted by this crate's own idx-backed decoder: object
+    // names, CRCs over the encoded entries, offsets and both checksums are all verified.
+    let mut pack = Pack::new(
+        Some(2),
+        Some(64 * 1024 * 1024),
+        Some(path.join("decode-tmp")),
+        true,
+    );
+    pack.decode_file_full_without_callback(&pack_file, None::<fn(ObjectHash)>)
+        .unwrap();
+    assert_eq!(pack.number, entries_number);
 
     let duration = start.elapsed();
     tracing::info!("test executed in: {:.2?}", duration);
@@ -1137,4 +1166,209 @@ fn test_parallel_encode_trailer_ignores_thread_local_kind() {
     })
     .join()
     .expect("encoder thread must not panic");
+}
+
+/// BLAKE3 in-memory encode/decode round-trip (no-delta and delta windows): the trailer, the
+/// decoded object IDs and the pack signature are all `ObjectHash::Blake3`, computed from the
+/// explicit encoder/decoder kind while the thread-local kind is SHA-1. A SHA-256 decoder
+/// rejects the same bytes (fail-closed, same width).
+#[tokio::test]
+async fn blake3_round_trip() {
+    let _guard = set_hash_kind_for_test(HashKind::Sha1);
+    let contents: Vec<String> = (0..12)
+        .map(|i| format!("blake3 round trip payload {i} {}", "x".repeat(i * 7)))
+        .collect();
+    let blobs: Vec<Blob> = contents
+        .iter()
+        .map(|c| Blob::from_content_with_kind(HashKind::Blake3, c).unwrap())
+        .collect();
+    // A tree over the blobs and a commit pointing at it, so all three object types round-trip.
+    let tree = Tree::from_tree_items_with_kind(
+        HashKind::Blake3,
+        blobs
+            .iter()
+            .enumerate()
+            .map(|(i, b)| TreeItem::new(TreeItemMode::Blob, b.id, format!("file-{i}.txt")))
+            .collect(),
+    )
+    .unwrap();
+    let commit =
+        Commit::from_tree_id_with_kind(HashKind::Blake3, tree.id, vec![], "blake3 pack").unwrap();
+    let mut entries: Vec<Entry> = blobs.iter().map(|b| Entry::from(b.clone())).collect();
+    entries.push(Entry::from(tree.clone()));
+    entries.push(Entry::from(commit.clone()));
+    let expected_ids: std::collections::HashSet<ObjectHash> =
+        entries.iter().map(|e| e.hash).collect();
+    assert_eq!(expected_ids.len(), blobs.len() + 2);
+    assert!(expected_ids.iter().all(|id| id.kind() == HashKind::Blake3));
+
+    for window in [0usize, 4] {
+        let (tx, mut rx) = mpsc::channel(64);
+        let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(64);
+        let mut encoder =
+            PackEncoder::new_with_hash_kind(HashKind::Blake3, entries.len(), window, tx);
+        assert_eq!(encoder.hash_kind(), HashKind::Blake3);
+        for entry in &entries {
+            entry_tx
+                .send(MetaAttached {
+                    inner: entry.clone(),
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(entry_tx);
+        encoder.encode(entry_rx).await.expect("blake3 encode");
+        let mut pack = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            pack.extend(chunk);
+        }
+        let trailer = encoder.get_hash().expect("final hash");
+        assert_eq!(trailer.kind(), HashKind::Blake3, "window {window}");
+        assert_eq!(&pack[pack.len() - 32..], trailer.to_data().as_slice());
+        assert_eq!(
+            trailer,
+            ObjectHash::new_for_kind(HashKind::Blake3, &pack[..pack.len() - 32])
+        );
+
+        // Decode with an explicit BLAKE3 pack (thread-local still SHA-1).
+        let decoded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = decoded.clone();
+        let tmp = tempdir().unwrap();
+        let mut p = Pack::new_with_hash_kind(
+            HashKind::Blake3,
+            Some(2),
+            Some(64 * 1024 * 1024),
+            Some(tmp.path().to_path_buf()),
+            true,
+        );
+        assert_eq!(p.hash_kind, HashKind::Blake3);
+        p.decode(
+            &mut Cursor::new(&pack),
+            move |entry| sink.lock().unwrap().push(entry.inner.hash),
+            None::<fn(ObjectHash)>,
+        )
+        .expect("blake3 decode");
+        assert_eq!(p.signature, trailer);
+        let decoded: std::collections::HashSet<ObjectHash> =
+            decoded.lock().unwrap().iter().copied().collect();
+        assert_eq!(decoded, expected_ids, "window {window}");
+        assert!(decoded.contains(&tree.id) && decoded.contains(&commit.id));
+
+        // Same bytes, SHA-256 decoder: the trailer no longer matches (fail-closed).
+        let tmp2 = tempdir().unwrap();
+        let mut wrong = Pack::new_with_hash_kind(
+            HashKind::Sha256,
+            Some(1),
+            Some(64 * 1024 * 1024),
+            Some(tmp2.path().to_path_buf()),
+            true,
+        );
+        let err = wrong
+            .decode(&mut Cursor::new(&pack), |_| {}, None::<fn(ObjectHash)>)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match the trailer hash"),
+            "window {window}: {err}"
+        );
+    }
+
+    // File output: the BLAKE3 pack/idx pair written by
+    // `encode_and_output_to_files_with_hash_kind` is accepted by the idx-backed decoder and by
+    // `PackStats` (names, CRCs over the encoded entries, offsets, both checksums), and is
+    // still refused under SHA-256.
+    let out = tempdir().unwrap();
+    let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(64);
+    let to_send = entries.clone();
+    tokio::spawn(async move {
+        for entry in to_send {
+            entry_tx
+                .send(MetaAttached {
+                    inner: entry,
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .unwrap();
+        }
+    });
+    super::output::encode_and_output_to_files_with_hash_kind(
+        HashKind::Blake3,
+        entry_rx,
+        entries.len(),
+        out.path().to_path_buf(),
+        4,
+    )
+    .await
+    .expect("blake3 files");
+    let pack_file = std::fs::read_dir(out.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "pack"))
+        .expect("pack file");
+    assert!(pack_file.with_extension("idx").is_file());
+    let mut p = Pack::new_with_hash_kind(
+        HashKind::Blake3,
+        Some(1),
+        Some(64 * 1024 * 1024),
+        Some(out.path().join("tmp")),
+        true,
+    );
+    p.decode_file_full_without_callback(&pack_file, None::<fn(ObjectHash)>)
+        .expect("blake3 idx-backed decode");
+    assert_eq!(p.number, entries.len());
+    assert_eq!(p.signature.kind(), HashKind::Blake3);
+    let stats = crate::internal::pack::stats::PackStats::analyze_with_hash_kind(
+        HashKind::Blake3,
+        &pack_file,
+    )
+    .expect("blake3 stats over generated idx");
+    assert_eq!(stats.total, entries.len());
+    let mut wrong = Pack::new_with_hash_kind(
+        HashKind::Sha256,
+        Some(1),
+        None,
+        Some(out.path().join("tmp2")),
+        true,
+    );
+    assert!(
+        wrong
+            .decode_file_full_without_callback(&pack_file, None::<fn(ObjectHash)>)
+            .is_err()
+    );
+}
+
+/// A BLAKE3 encoder refuses an entry whose ID belongs to another kind (same width or not), on
+/// both the delta-window and the parallel no-delta paths.
+#[tokio::test]
+async fn blake3_round_trip_rejects_cross_kind_entries() {
+    let _guard = set_hash_kind_for_test(HashKind::Sha1);
+    for (window, foreign) in [
+        (0usize, HashKind::Sha256),
+        (4, HashKind::Sha1),
+        (0, HashKind::Sha1),
+    ] {
+        let blob = Blob::from_content_with_kind(foreign, "foreign").unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(8);
+        let mut encoder = PackEncoder::new_with_hash_kind(HashKind::Blake3, 1, window, tx);
+        entry_tx
+            .send(MetaAttached {
+                inner: Entry::from(blob),
+                meta: EntryMeta::new(),
+            })
+            .await
+            .unwrap();
+        drop(entry_tx);
+        let err = if window == 0 {
+            encoder.parallel_encode(entry_rx).await.unwrap_err()
+        } else {
+            encoder.encode(entry_rx).await.unwrap_err()
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be encoded into a blake3 pack"),
+            "{msg}"
+        );
+        assert!(msg.contains(foreign.as_str()), "{msg}");
+    }
 }

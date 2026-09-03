@@ -18,7 +18,7 @@ use std::sync::{Arc, atomic::AtomicUsize};
 use threadpool::ThreadPool;
 
 use crate::{
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash},
     internal::{
         object::ObjectTrait,
         pack::{cache::Caches, waitlist::Waitlist},
@@ -29,6 +29,9 @@ const DEFAULT_TMP_DIR: &str = "./.cache_temp";
 
 /// Representation of a Git pack file in memory.
 pub struct Pack {
+    /// Repository hash kind used for every object ID, ref-delta base, pack trailer and idx
+    /// checksum this pack touches (explicit; never read from a worker's thread-local).
+    pub hash_kind: HashKind,
     pub number: usize,
     pub signature: ObjectHash,
     pub objects: Vec<Box<dyn ObjectTrait>>,

@@ -308,4 +308,52 @@ mod tests {
             );
         }
     }
+
+    /// A BLAKE3 `ReadBoxed` streams the inflated object through a BLAKE3 hasher (no second
+    /// pass over the payload) and yields the canonical BLAKE3 object ID, distinct from the
+    /// same-width SHA-256 ID, while the thread-local kind is SHA-1.
+    #[test]
+    fn blake3_hash_kind() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let body: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let compressed = zlib_compress(&body);
+
+        let mut reader = ReadBoxed::new_with_kind(
+            io::Cursor::new(&compressed),
+            ObjectType::Blob,
+            body.len(),
+            HashKind::Blake3,
+        )
+        .unwrap();
+        assert_eq!(reader.hash_kind(), HashKind::Blake3);
+        let mut out = Vec::new();
+        // Read in small chunks so the hash is accumulated incrementally, as in pack decode.
+        let mut chunk = [0u8; 97];
+        loop {
+            let n = reader.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(out, body);
+        let id = reader.hash.finalize_object_hash();
+        assert_eq!(id.kind(), HashKind::Blake3);
+        assert_eq!(
+            id,
+            ObjectHash::from_type_and_data_for_kind(HashKind::Blake3, ObjectType::Blob, &body)
+                .unwrap()
+        );
+        assert_ne!(
+            id.as_ref(),
+            ObjectHash::from_type_and_data_for_kind(HashKind::Sha256, ObjectType::Blob, &body)
+                .unwrap()
+                .as_ref()
+        );
+        assert_eq!(
+            ReadBoxed::new_for_delta_with_kind(io::Cursor::new(&compressed), HashKind::Blake3)
+                .hash_kind(),
+            HashKind::Blake3
+        );
+    }
 }

@@ -65,6 +65,7 @@ impl super::PackEncoder {
                                     entry.inner.obj_type
                                 )));
                             }
+                            self.check_entry_kind(&entry.inner)?;
                             batch_entries.push(entry.inner);
                             self.process_index += 1;
                         }
@@ -94,6 +95,9 @@ impl super::PackEncoder {
                 for obj_data in batch_result {
                     let (encoded_bytes, mut idx_entry) = obj_data?;
                     idx_entry.offset = self.inner_offset as u64;
+                    // idx v2 CRC32 covers the encoded pack entry (what the decoders verify),
+                    // not the decompressed content the placeholder entry was built from.
+                    idx_entry.crc32 = crc32fast::hash(&encoded_bytes);
                     self.write_owned_and_update(encoded_bytes).await;
                     idx_entries.push(idx_entry);
                 }

@@ -33,7 +33,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
     errors::GitError,
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash, get_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::types::ObjectType,
@@ -62,6 +62,10 @@ pub struct PackEncoder {
     idx_entries: Option<Vec<IndexEntry>>,
     /// Absolute byte offset where the next pack entry will begin.
     inner_offset: usize,
+    /// Repository hash kind: drives the pack checksum, the width of every ref-delta base
+    /// ID and the idx object names. Explicit so encoding on a foreign worker thread stays
+    /// correct.
+    hash_kind: HashKind,
     /// Running checksum of the pack, excluding the checksum trailer itself.
     inner_hash: HashAlgorithm,
     /// Final pack checksum, available only after all entries have been encoded.
@@ -76,8 +80,21 @@ pub struct PackEncoder {
 }
 
 impl PackEncoder {
-    /// Create an encoder that streams pack bytes but does not build an index.
+    /// Create an encoder that streams pack bytes but does not build an index, using the
+    /// thread-local [`HashKind`] (compatibility wrapper around
+    /// [`PackEncoder::new_with_hash_kind`]).
     pub fn new(object_number: usize, window_size: usize, sender: mpsc::Sender<Vec<u8>>) -> Self {
+        Self::new_with_hash_kind(get_hash_kind(), object_number, window_size, sender)
+    }
+
+    /// Create an encoder for an explicit repository `hash_kind` that streams pack bytes but
+    /// does not build an index.
+    pub fn new_with_hash_kind(
+        hash_kind: HashKind,
+        object_number: usize,
+        window_size: usize,
+        sender: mpsc::Sender<Vec<u8>>,
+    ) -> Self {
         PackEncoder {
             object_number,
             window_size,
@@ -86,15 +103,36 @@ impl PackEncoder {
             idx_sender: None,
             idx_entries: None,
             inner_offset: 12, // The first entry begins immediately after the pack header.
-            inner_hash: HashAlgorithm::new(),
+            hash_kind,
+            inner_hash: HashAlgorithm::new_for_kind(hash_kind),
             final_hash: None,
             start_encoding: false,
             disable_prefilter: false,
         }
     }
 
-    /// Create an encoder that streams pack bytes and retains metadata for a later `.idx` stream.
+    /// Create an encoder that streams pack bytes and retains metadata for a later `.idx`
+    /// stream, using the thread-local [`HashKind`] (compatibility wrapper around
+    /// [`PackEncoder::new_with_idx_and_hash_kind`]).
     pub fn new_with_idx(
+        object_number: usize,
+        window_size: usize,
+        pack_sender: mpsc::Sender<Vec<u8>>,
+        idx_sender: mpsc::Sender<Vec<u8>>,
+    ) -> Self {
+        Self::new_with_idx_and_hash_kind(
+            get_hash_kind(),
+            object_number,
+            window_size,
+            pack_sender,
+            idx_sender,
+        )
+    }
+
+    /// Create an encoder for an explicit repository `hash_kind` that streams pack bytes and
+    /// retains metadata for a later `.idx` stream.
+    pub fn new_with_idx_and_hash_kind(
+        hash_kind: HashKind,
         object_number: usize,
         window_size: usize,
         pack_sender: mpsc::Sender<Vec<u8>>,
@@ -108,11 +146,28 @@ impl PackEncoder {
             idx_sender: Some(idx_sender),
             idx_entries: None,
             inner_offset: 12, // The first entry begins immediately after the pack header.
-            inner_hash: HashAlgorithm::new(),
+            hash_kind,
+            inner_hash: HashAlgorithm::new_for_kind(hash_kind),
             final_hash: None,
             start_encoding: false,
             disable_prefilter: false,
         }
+    }
+
+    /// Repository hash kind this encoder writes (pack checksum, ref-delta base IDs, idx names).
+    pub fn hash_kind(&self) -> HashKind {
+        self.hash_kind
+    }
+
+    /// Reject an entry whose object ID belongs to another hash kind: a pack (and its idx)
+    /// carries exactly one repository kind.
+    fn check_entry_kind(&self, entry: &Entry) -> Result<(), GitError> {
+        entry.hash.ensure_kind(self.hash_kind).map_err(|e| {
+            GitError::PackEncodeError(format!(
+                "entry {} cannot be encoded into a {} pack: {e}",
+                entry.hash, self.hash_kind
+            ))
+        })
     }
 
     /// Close the pack output stream by dropping the encoder's final sender.
@@ -208,6 +263,7 @@ impl PackEncoder {
         let mut blobs: Vec<MetaAttached<Entry, EntryMeta>> = Vec::new();
         let mut tags: Vec<MetaAttached<Entry, EntryMeta>> = Vec::new();
         while let Some(entry) = entry_rx.recv().await {
+            self.check_entry_kind(&entry.inner)?;
             match entry.inner.obj_type {
                 ObjectType::Commit => {
                     commits.push(entry);
@@ -396,6 +452,10 @@ impl PackEncoder {
         for res in &mut all_res {
             for (encoded_bytes, mut idx_entry) in res.drain(..) {
                 idx_entry.offset = self.inner_offset as u64;
+                // idx v2 CRC32 covers the object's *encoded* pack bytes (header, base
+                // reference and compressed payload) — exactly what the idx-backed decoders
+                // verify — not the decompressed content the placeholder entry was built from.
+                idx_entry.crc32 = crc32fast::hash(&encoded_bytes);
                 self.write_owned_and_update(encoded_bytes).await;
                 idx_entries.push(idx_entry);
             }

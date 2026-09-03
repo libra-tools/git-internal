@@ -1,8 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     fs::File,
-    io::{self, BufRead, BufReader, ErrorKind, Read},
+    io::{BufRead, BufReader, ErrorKind, Read},
     path::Path,
 };
 
@@ -10,13 +10,15 @@ use flate2::bufread::ZlibDecoder;
 
 use crate::{
     errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
-    internal::pack::{Pack, utils, wrapper::Wrapper},
-    utils::{CountingReader, HashAlgorithm},
+    hash::{HashKind, ObjectHash, get_hash_kind},
+    internal::pack::{Pack, pack_index, utils, wrapper::Wrapper},
+    utils::CountingReader,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PackStats {
+    /// Repository hash kind the pack (trailer, ref-delta bases, idx) was verified with.
+    pub hash_kind: HashKind,
     pub total: usize,
     pub commits: usize,
     pub trees: usize,
@@ -27,50 +29,19 @@ pub struct PackStats {
 
 struct PackScan {
     stats: PackStats,
+    /// `(offset, name)` of every base (non-delta) object, streamed through the `kind` hasher.
+    base_objects: Vec<(usize, ObjectHash)>,
     ref_delta_bases: HashSet<ObjectHash>,
+    /// Start offset of every object in the pack (base and delta).
+    object_offsets: HashSet<usize>,
     pack_hash: ObjectHash,
 }
 
-struct PackIndexHashes {
-    objects: HashSet<ObjectHash>,
+struct PackIndexEntries {
+    names: HashSet<ObjectHash>,
+    /// Name recorded by the idx at each pack offset (offsets are unique).
+    by_offset: HashMap<u64, ObjectHash>,
     pack_hash: ObjectHash,
-}
-
-struct HashingReader<R> {
-    inner: R,
-    hash: HashAlgorithm,
-}
-
-impl<R> HashingReader<R> {
-    fn new(inner: R) -> Self {
-        Self {
-            inner,
-            hash: HashAlgorithm::new(),
-        }
-    }
-
-    fn current_hash(&self) -> Result<ObjectHash, GitError> {
-        ObjectHash::from_bytes(&self.hash.clone().finalize())
-            .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))
-    }
-}
-
-impl<R: Read> HashingReader<R> {
-    fn read_without_hash(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
-    }
-
-    fn read_exact_without_hash(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        self.inner.read_exact(buf)
-    }
-}
-
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hash.update(&buf[..n]);
-        Ok(n)
-    }
 }
 
 impl fmt::Display for PackStats {
@@ -84,7 +55,32 @@ impl fmt::Display for PackStats {
 }
 
 impl PackStats {
+    /// Empty statistics tagged with an explicit repository `hash_kind`.
+    pub fn new_with_hash_kind(hash_kind: HashKind) -> Self {
+        PackStats {
+            hash_kind,
+            ..Default::default()
+        }
+    }
+
+    /// Repository hash kind these statistics were computed for.
+    pub fn hash_kind(&self) -> HashKind {
+        self.hash_kind
+    }
+
+    /// Analyze a pack using the thread-local [`HashKind`]; compatibility wrapper around
+    /// [`PackStats::analyze_with_hash_kind`].
     pub fn analyze<P: AsRef<Path>>(pack_path: P) -> Result<PackStats, GitError> {
+        Self::analyze_with_hash_kind(get_hash_kind(), pack_path)
+    }
+
+    /// Analyze a pack of an explicit repository `kind`: the pack trailer, every ref-delta
+    /// base ID and the accompanying idx (object names, pack checksum, idx checksum) are
+    /// parsed and verified with that kind and never inferred from their length.
+    pub fn analyze_with_hash_kind<P: AsRef<Path>>(
+        kind: HashKind,
+        pack_path: P,
+    ) -> Result<PackStats, GitError> {
         let pack_path = pack_path.as_ref();
         if !pack_path.exists() {
             return Err(GitError::InvalidPackFile(format!(
@@ -95,23 +91,63 @@ impl PackStats {
 
         let f = File::open(pack_path)
             .map_err(|e| GitError::InvalidPackFile(format!("Failed to open pack file: {e}")))?;
-        let scan = Self::scan(BufReader::new(f))?;
-        if !scan.ref_delta_bases.is_empty() {
-            let index_hashes = Self::read_pack_index_hashes(pack_path)?.ok_or_else(|| {
-                GitError::InvalidPackFile(
-                    "Pack index is required to verify ref-delta bases".to_string(),
-                )
-            })?;
-            if index_hashes.pack_hash != scan.pack_hash {
+        let scan = Self::scan(BufReader::new(f), kind)?;
+        let index = Self::read_pack_index_hashes(pack_path, kind)?;
+        if index.is_none() && !scan.ref_delta_bases.is_empty() {
+            return Err(GitError::InvalidPackFile(
+                "Pack index is required to verify ref-delta bases".to_string(),
+            ));
+        }
+        // An existing idx is verified against the pack even when there are no ref-deltas:
+        // object count, copied pack checksum, every base object's streamed content hash and
+        // every ref-delta base must all agree (fail-closed). This is a single-pass statistics
+        // scan that inflates and hashes every base payload but does not resolve delta chains, so the idx names of *delta* objects are
+        // outside its verification scope (their idx offsets must still be object boundaries);
+        // `Pack::decode_file_full_without_callback` (or any decode that resolves deltas)
+        // verifies those names by rebuilding each delta.
+        if let Some(index) = index {
+            if index.names.len() != scan.stats.total {
+                return Err(GitError::InvalidPackFile(format!(
+                    "Pack index lists {} objects but the pack contains {}",
+                    index.names.len(),
+                    scan.stats.total
+                )));
+            }
+            if index.pack_hash != scan.pack_hash {
                 return Err(GitError::InvalidPackFile(format!(
                     "Pack index hash {} does not match pack trailer hash {}",
-                    index_hashes.pack_hash, scan.pack_hash
+                    index.pack_hash, scan.pack_hash
                 )));
+            }
+            // Every idx entry must point at an object boundary of this pack.
+            if let Some((offset, name)) = index.by_offset.iter().find(|(offset, _)| {
+                !usize::try_from(**offset).is_ok_and(|offset| scan.object_offsets.contains(&offset))
+            }) {
+                return Err(GitError::InvalidPackFile(format!(
+                    "Pack index entry {name} points at offset {offset}, which is not an object boundary of the pack"
+                )));
+            }
+            // Every base object must be named by the idx *at its own offset*: a set-level
+            // comparison would accept an idx whose names are merely permuted across offsets.
+            for (offset, hash) in &scan.base_objects {
+                match index.by_offset.get(&(*offset as u64)) {
+                    Some(name) if name == hash => {}
+                    Some(name) => {
+                        return Err(GitError::InvalidPackFile(format!(
+                            "Pack object {hash} ({kind}) at offset {offset} is not named by the pack index at that offset (index names {name})"
+                        )));
+                    }
+                    None => {
+                        return Err(GitError::InvalidPackFile(format!(
+                            "Pack object {hash} ({kind}) at offset {offset} is not named by the pack index (no index entry at that offset)"
+                        )));
+                    }
+                }
             }
             if let Some(base_hash) = scan
                 .ref_delta_bases
                 .iter()
-                .find(|base_hash| !index_hashes.objects.contains(*base_hash))
+                .find(|base_hash| !index.names.contains(*base_hash))
             {
                 return Err(GitError::InvalidPackFile(format!(
                     "Ref-delta base {base_hash} is not present in the pack index"
@@ -139,10 +175,11 @@ impl PackStats {
         Ok(count)
     }
 
-    fn scan(reader: impl BufRead) -> Result<PackScan, GitError> {
-        let mut reader = Wrapper::new(reader);
+    fn scan(reader: impl BufRead, kind: HashKind) -> Result<PackScan, GitError> {
+        let mut reader = Wrapper::new_with_kind(reader, kind);
         let (object_num, header_data) = Pack::check_header(&mut reader)?;
         let mut stats = PackStats {
+            hash_kind: kind,
             total: object_num as usize,
             ..Default::default()
         };
@@ -150,6 +187,7 @@ impl PackStats {
         let mut offset = first_object_offset;
         let mut object_starts = HashSet::new();
         let mut ref_delta_bases = HashSet::new();
+        let mut base_objects = Vec::new();
 
         for _ in 0..object_num {
             let object_start = offset;
@@ -161,7 +199,16 @@ impl PackStats {
             stats.count_type_bits(type_bits, offset)?;
 
             match type_bits {
-                1..=4 => drain_zlib(&mut reader, &mut offset, size)?,
+                1..=4 => {
+                    // Stream the base object through the hasher (no payload retained) so its
+                    // name can be checked against the idx.
+                    let obj_type =
+                        crate::internal::object::types::ObjectType::from_pack_type_u8(type_bits)?;
+                    let (hash, consumed) =
+                        Pack::hash_compressed_object(&mut reader, obj_type, size, kind)?;
+                    add_to_offset(&mut offset, consumed)?;
+                    base_objects.push((object_start, hash));
+                }
                 5 | 6 => {
                     let (delta_offset, consumed) = utils::read_offset_encoding(&mut reader)
                         .map_err(|e| {
@@ -191,11 +238,12 @@ impl PackStats {
                     drain_zlib(&mut reader, &mut offset, size)?;
                 }
                 7 => {
-                    let base_hash = ObjectHash::from_stream(&mut reader).map_err(|e| {
-                        GitError::InvalidPackFile(format!(
-                            "Read hash error at offset {offset}: {e}"
-                        ))
-                    })?;
+                    let base_hash =
+                        ObjectHash::from_stream_for_kind(kind, &mut reader).map_err(|e| {
+                            GitError::InvalidPackFile(format!(
+                                "Read hash error at offset {offset}: {e}"
+                            ))
+                        })?;
                     add_to_offset(&mut offset, base_hash.size())?;
                     ref_delta_bases.insert(base_hash);
                     drain_zlib(&mut reader, &mut offset, size)?;
@@ -206,7 +254,7 @@ impl PackStats {
         }
 
         let computed_hash = reader.final_hash();
-        let trailer = ObjectHash::from_stream(&mut reader).map_err(|e| {
+        let trailer = ObjectHash::from_stream_for_kind(kind, &mut reader).map_err(|e| {
             GitError::InvalidPackFile(format!("Failed to read trailer hash: {e:?}"))
         })?;
         if computed_hash != trailer {
@@ -222,91 +270,58 @@ impl PackStats {
 
         Ok(PackScan {
             stats,
+            base_objects,
             ref_delta_bases,
+            object_offsets: object_starts,
             pack_hash: trailer,
         })
     }
 
-    fn read_pack_index_hashes(pack_path: &Path) -> Result<Option<PackIndexHashes>, GitError> {
+    fn read_pack_index_hashes(
+        pack_path: &Path,
+        kind: HashKind,
+    ) -> Result<Option<PackIndexEntries>, GitError> {
         let idx_path = pack_path.with_extension("idx");
-        let idx_file = match File::open(&idx_path) {
-            Ok(file) => file,
+        // `symlink_metadata`: a dangling `.idx` symlink counts as present (and then fails to
+        // open) instead of being mistaken for a missing idx; only NotFound means "no idx".
+        match std::fs::symlink_metadata(&idx_path) {
+            Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => {
                 return Err(GitError::InvalidPackFile(format!(
-                    "Failed to open pack index {}: {e}",
+                    "Pack index {} exists but cannot be read: {e}",
                     idx_path.display()
                 )));
             }
-        };
-        let mut reader = HashingReader::new(BufReader::new(idx_file));
-
-        let magic = read_be_u32(&mut reader)?;
-        let version = read_be_u32(&mut reader)?;
-        if magic != 0xff74_4f63 || version != 2 {
-            return Err(GitError::InvalidPackFile(
-                "Only pack index v2 is supported for ref-delta validation".to_string(),
-            ));
         }
-
-        let mut object_num = 0usize;
-        for _ in 0..256 {
-            object_num = read_be_u32(&mut reader)? as usize;
-        }
-
-        let hash_size = get_hash_kind().size();
-        let mut objects = HashSet::new();
-        let mut hash_buf = vec![0; hash_size];
-        for _ in 0..object_num {
-            reader
-                .read_exact(&mut hash_buf)
-                .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-            let hash = ObjectHash::from_bytes(&hash_buf)
-                .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-            objects.insert(hash);
-        }
-
-        let crc_bytes = checked_mul(object_num, 4, "Pack index is too large")?;
-        discard_exact(&mut reader, crc_bytes)?;
-
-        let mut large_offset_count = 0usize;
-        for _ in 0..object_num {
-            let offset = read_be_u32(&mut reader)?;
-            if offset & 0x8000_0000 != 0 {
-                large_offset_count = large_offset_count.checked_add(1).ok_or_else(|| {
-                    GitError::InvalidPackFile("Pack index is too large".to_string())
-                })?;
+        let idx_file = File::open(&idx_path).map_err(|e| {
+            GitError::InvalidPackFile(format!(
+                "Pack index {} exists but cannot be read: {e}",
+                idx_path.display()
+            ))
+        })?;
+        let idx_len = idx_file
+            .metadata()
+            .map_err(|e| GitError::InvalidPackFile(format!("Read pack index metadata error: {e}")))?
+            .len();
+        // Streamed, size-bounded parse (no whole-file buffer).
+        let parsed = pack_index::parse_idx_v2_from(BufReader::new(idx_file), kind, idx_len)?;
+        let mut names = HashSet::with_capacity(parsed.entries.len());
+        let mut by_offset = HashMap::with_capacity(parsed.entries.len());
+        for entry in parsed.entries {
+            names.insert(entry.hash);
+            if by_offset.insert(entry.offset, entry.hash).is_some() {
+                return Err(GitError::InvalidPackFile(format!(
+                    "Pack index lists offset {} more than once",
+                    entry.offset
+                )));
             }
         }
-        let large_offset_bytes = checked_mul(large_offset_count, 8, "Pack index is too large")?;
-        discard_exact(&mut reader, large_offset_bytes)?;
-
-        let pack_hash = ObjectHash::from_stream(&mut reader)
-            .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-        let expected_idx_hash = reader.current_hash()?;
-        let mut idx_hash_buf = vec![0; hash_size];
-        reader
-            .read_exact_without_hash(&mut idx_hash_buf)
-            .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-        let idx_hash = ObjectHash::from_bytes(&idx_hash_buf)
-            .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-        if idx_hash != expected_idx_hash {
-            return Err(GitError::InvalidPackFile(format!(
-                "Pack index checksum {idx_hash} does not match calculated checksum {expected_idx_hash}"
-            )));
-        }
-        let mut trailing = [0; 1];
-        if reader
-            .read_without_hash(&mut trailing)
-            .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?
-            != 0
-        {
-            return Err(GitError::InvalidPackFile(
-                "Pack index has trailing data after checksum".to_string(),
-            ));
-        }
-
-        Ok(Some(PackIndexHashes { objects, pack_hash }))
+        Ok(Some(PackIndexEntries {
+            names,
+            by_offset,
+            pack_hash: parsed.pack_hash,
+        }))
     }
 
     fn count_type_bits(&mut self, type_bits: u8, offset: usize) -> Result<(), GitError> {
@@ -382,37 +397,15 @@ fn add_to_offset(offset: &mut usize, consumed: usize) -> Result<(), GitError> {
     Ok(())
 }
 
-fn read_be_u32(reader: &mut impl Read) -> Result<u32, GitError> {
-    let mut buf = [0; 4];
-    reader
-        .read_exact(&mut buf)
-        .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-    Ok(u32::from_be_bytes(buf))
-}
-
-fn discard_exact(reader: &mut impl Read, mut len: usize) -> Result<(), GitError> {
-    let mut scratch = [0; 8192];
-    while len != 0 {
-        let chunk_len = len.min(scratch.len());
-        reader
-            .read_exact(&mut scratch[..chunk_len])
-            .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-        len -= chunk_len;
-    }
-    Ok(())
-}
-
-fn checked_mul(lhs: usize, rhs: usize, message: &str) -> Result<usize, GitError> {
-    lhs.checked_mul(rhs)
-        .ok_or_else(|| GitError::InvalidPackFile(message.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::{
         hash::{HashKind, set_hash_kind_for_test},
         internal::pack::test_pack_download::download_pack_file,
+        utils::HashAlgorithm,
     };
 
     #[test]
@@ -604,9 +597,249 @@ mod tests {
     }
 
     fn append_pack_trailer(bytes: &mut Vec<u8>) {
-        let mut hash = HashAlgorithm::new();
+        append_pack_trailer_for_kind(bytes, get_hash_kind());
+    }
+
+    fn append_pack_trailer_for_kind(bytes: &mut Vec<u8>, kind: HashKind) {
+        let mut hash = HashAlgorithm::new_for_kind(kind);
         hash.update(bytes);
-        let trailer = ObjectHash::from_bytes(&hash.finalize()).expect("pack hash");
+        let trailer = hash.finalize_object_hash();
         bytes.extend_from_slice(trailer.as_ref());
+    }
+
+    fn append_zlib(out: &mut Vec<u8>, data: &[u8]) {
+        use std::io::Write;
+        let mut deflate =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        deflate.write_all(data).expect("zlib payload");
+        out.extend_from_slice(&deflate.finish().expect("finish zlib payload"));
+    }
+
+    /// Minimal idx v2 writer for one BLAKE3 pack (used to exercise ref-delta validation).
+    fn write_idx_v2_for_kind(
+        pack_path: &Path,
+        objects: &[(ObjectHash, u32)],
+        kind: HashKind,
+        version: u32,
+    ) {
+        let mut objects: Vec<(ObjectHash, u32)> = objects.to_vec();
+        objects.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+        let mut idx = Vec::new();
+        idx.extend_from_slice(&0xff74_4f63u32.to_be_bytes());
+        idx.extend_from_slice(&version.to_be_bytes());
+        for fanout_idx in 0..256 {
+            let count = objects
+                .iter()
+                .filter(|(h, _)| h.as_ref()[0] as usize <= fanout_idx)
+                .count() as u32;
+            idx.extend_from_slice(&count.to_be_bytes());
+        }
+        for (h, _) in &objects {
+            idx.extend_from_slice(h.as_ref());
+        }
+        for _ in &objects {
+            idx.extend_from_slice(&0u32.to_be_bytes());
+        }
+        for (_, off) in &objects {
+            idx.extend_from_slice(&off.to_be_bytes());
+        }
+        let pack = std::fs::read(pack_path).unwrap();
+        idx.extend_from_slice(&pack[pack.len() - kind.size()..]);
+        let mut hasher = HashAlgorithm::new_for_kind(kind);
+        hasher.update(&idx);
+        let idx_hash = hasher.finalize_object_hash();
+        idx.extend_from_slice(idx_hash.as_ref());
+        std::fs::write(pack_path.with_extension("idx"), idx).unwrap();
+    }
+
+    /// `PackStats::analyze_with_hash_kind(Blake3)` verifies a BLAKE3 trailer, resolves 32-byte
+    /// BLAKE3 ref-delta bases through a BLAKE3 idx v2, rejects the same pack under SHA-256 and
+    /// rejects an idx whose version is not 2 — all with a SHA-1 thread-local kind.
+    #[test]
+    fn blake3_pack_stats() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let kind = HashKind::Blake3;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Two plain blobs.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PACK");
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        write_pack_object_header(&mut bytes, 3, 5);
+        append_zlib(&mut bytes, b"hello");
+        let world_offset = bytes.len() as u32;
+        write_pack_object_header(&mut bytes, 3, 5);
+        append_zlib(&mut bytes, b"world");
+        append_pack_trailer_for_kind(&mut bytes, kind);
+        let plain = dir.path().join("plain.pack");
+        std::fs::write(&plain, &bytes).unwrap();
+
+        let stats = PackStats::analyze_with_hash_kind(kind, &plain).expect("blake3 stats");
+        assert_eq!(stats.hash_kind(), HashKind::Blake3);
+        assert_eq!(PackStats::new_with_hash_kind(kind).hash_kind(), kind);
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.blobs, 2);
+        assert_eq!(stats.deltas, 0);
+        // Legacy `analyze` follows the thread-local (SHA-1) kind and cannot verify the trailer.
+        assert!(PackStats::analyze(&plain).is_err());
+        // An idx next to a plain pack is verified too: a checksum-valid idx naming an object
+        // wrongly is rejected, the correct one is accepted.
+        let hello = utils::calculate_object_hash_for_kind(
+            kind,
+            crate::internal::object::types::ObjectType::Blob,
+            b"hello",
+        )
+        .unwrap();
+        let world = utils::calculate_object_hash_for_kind(
+            kind,
+            crate::internal::object::types::ObjectType::Blob,
+            b"world",
+        )
+        .unwrap();
+        let bogus = ObjectHash::new_for_kind(kind, b"bogus");
+        write_idx_v2_for_kind(&plain, &[(hello, 12), (bogus, world_offset)], kind, 2);
+        let err = PackStats::analyze_with_hash_kind(kind, &plain).unwrap_err();
+        assert!(
+            err.to_string().contains("is not named by the pack index"),
+            "{err}"
+        );
+        write_idx_v2_for_kind(&plain, &[(hello, 12), (world, world_offset)], kind, 2);
+        assert_eq!(
+            PackStats::analyze_with_hash_kind(kind, &plain)
+                .unwrap()
+                .blobs,
+            2
+        );
+        // Swapping the offsets of two correctly named objects is caught: names are verified
+        // at their own offsets, not as a set.
+        write_idx_v2_for_kind(&plain, &[(hello, world_offset), (world, 12)], kind, 2);
+        let err = PackStats::analyze_with_hash_kind(kind, &plain).unwrap_err();
+        assert!(err.to_string().contains("index names"), "{err}");
+        // An idx entry that does not point at an object boundary is rejected.
+        write_idx_v2_for_kind(&plain, &[(hello, 12), (world, 13)], kind, 2);
+        let err = PackStats::analyze_with_hash_kind(kind, &plain).unwrap_err();
+        assert!(err.to_string().contains("not an object boundary"), "{err}");
+        // A dangling `.idx` symlink is an error, never a fallback to the no-idx path.
+        #[cfg(unix)]
+        {
+            let idx_path = plain.with_extension("idx");
+            std::fs::remove_file(&idx_path).unwrap();
+            std::os::unix::fs::symlink(dir.path().join("missing.idx"), &idx_path).unwrap();
+            let err = PackStats::analyze_with_hash_kind(kind, &plain).unwrap_err();
+            assert!(err.to_string().contains("cannot be read"), "{err}");
+            std::fs::remove_file(&idx_path).unwrap();
+        }
+        write_idx_v2_for_kind(&plain, &[(hello, 12), (world, world_offset)], kind, 2);
+        assert_eq!(
+            PackStats::analyze_with_hash_kind(kind, &plain)
+                .unwrap()
+                .blobs,
+            2
+        );
+        let err = PackStats::analyze_with_hash_kind(HashKind::Sha256, &plain).unwrap_err();
+        assert!(err.to_string().contains("Pack trailer mismatch"), "{err}");
+
+        // Base blob + ref delta whose base ID is a 32-byte BLAKE3 hash.
+        let base_hash = utils::calculate_object_hash_for_kind(
+            kind,
+            crate::internal::object::types::ObjectType::Blob,
+            b"hello",
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PACK");
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        let base_offset = bytes.len() as u32;
+        write_pack_object_header(&mut bytes, 3, 5);
+        append_zlib(&mut bytes, b"hello");
+        let delta_offset = bytes.len() as u32;
+        let delta_hash = utils::calculate_object_hash_for_kind(
+            kind,
+            crate::internal::object::types::ObjectType::Blob,
+            b"HELLO",
+        )
+        .unwrap();
+        write_pack_object_header(&mut bytes, 7, 8);
+        bytes.extend_from_slice(base_hash.as_ref());
+        append_zlib(
+            &mut bytes,
+            [b"\x05\x05\x05".as_ref(), b"HELLO"].concat().as_slice(),
+        );
+        append_pack_trailer_for_kind(&mut bytes, kind);
+        let delta = dir.path().join("delta.pack");
+        std::fs::write(&delta, &bytes).unwrap();
+
+        // Without an idx the ref-delta base cannot be verified.
+        assert!(
+            PackStats::analyze_with_hash_kind(kind, &delta)
+                .unwrap_err()
+                .to_string()
+                .contains("Pack index is required")
+        );
+        // Write the idx with the crate's own `IdxBuilder` (BLAKE3 names + checksums) so the
+        // writer and this reader are verified against each other end-to-end.
+        {
+            use crate::internal::pack::pack_index::{IdxBuilder, IndexEntry};
+            let pack_hash =
+                ObjectHash::from_bytes_for_kind(kind, &bytes[bytes.len() - 32..]).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let idx_bytes = rt.block_on(async {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+                let mut builder = IdxBuilder::new(2, tx, pack_hash);
+                assert_eq!(builder.hash_kind(), kind);
+                builder
+                    .write_idx(vec![
+                        IndexEntry {
+                            hash: base_hash,
+                            crc32: 0,
+                            offset: base_offset as u64,
+                        },
+                        IndexEntry {
+                            hash: delta_hash,
+                            crc32: 0,
+                            offset: delta_offset as u64,
+                        },
+                    ])
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                while let Some(chunk) = rx.recv().await {
+                    out.extend_from_slice(&chunk);
+                }
+                out
+            });
+            std::fs::write(delta.with_extension("idx"), idx_bytes).unwrap();
+        }
+        let stats =
+            PackStats::analyze_with_hash_kind(kind, &delta).expect("blake3 ref-delta stats");
+        assert_eq!(stats.hash_kind(), kind);
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.blobs, 1);
+        assert_eq!(stats.deltas, 1);
+        // An idx that lists fewer objects than the pack is rejected.
+        write_idx_v2_for_kind(&delta, &[(base_hash, base_offset)], kind, 2);
+        let err = PackStats::analyze_with_hash_kind(kind, &delta).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lists 1 objects but the pack contains 2"),
+            "{err}"
+        );
+        // An idx of any other version is rejected for BLAKE3.
+        write_idx_v2_for_kind(
+            &delta,
+            &[(base_hash, base_offset), (delta_hash, delta_offset)],
+            kind,
+            1,
+        );
+        let err = PackStats::analyze_with_hash_kind(kind, &delta).unwrap_err();
+        assert!(
+            err.to_string().contains("Only pack index v2") && err.to_string().contains("blake3"),
+            "{err}"
+        );
     }
 }

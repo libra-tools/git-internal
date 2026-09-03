@@ -40,7 +40,7 @@ use crate::{
             cache_object::{CacheObject, CacheObjectInfo, MemSizeRecorder},
             channel_reader::StreamBufReader,
             entry::Entry,
-            utils,
+            pack_index, utils,
             waitlist::Waitlist,
             wrapper::Wrapper,
         },
@@ -54,43 +54,6 @@ struct CrcCountingReader<R> {
     inner: R,
     bytes_read: u64,
     crc: Option<crc32fast::Hasher>,
-}
-
-struct HashingReader<R> {
-    inner: R,
-    hash: HashAlgorithm,
-}
-
-impl<R> HashingReader<R> {
-    fn new(inner: R) -> Self {
-        Self {
-            inner,
-            hash: HashAlgorithm::new(),
-        }
-    }
-
-    fn current_hash(&self) -> Result<ObjectHash, GitError> {
-        ObjectHash::from_bytes(&self.hash.clone().finalize())
-            .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))
-    }
-}
-
-impl<R: Read> HashingReader<R> {
-    fn read_without_hash(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
-    }
-
-    fn read_exact_without_hash(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        self.inner.read_exact(buf)
-    }
-}
-
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hash.update(&buf[..n]);
-        Ok(n)
-    }
 }
 
 impl<R: Read> Read for CrcCountingReader<R> {
@@ -149,6 +112,10 @@ struct DecodeRetention {
 struct DecodeScan {
     retention: DecodeRetention,
     object_hashes: Option<Vec<ObjectHash>>,
+    /// idx CRC32 per object (pack order), verified while decoding when CRCs are tracked.
+    object_crcs: Option<Vec<u32>>,
+    /// idx offset per object (pack order), verified against each object's real start offset.
+    object_offsets: Option<Vec<usize>>,
     pack_hash: Option<ObjectHash>,
     pack_hash_check: Option<PackHashCheck>,
 }
@@ -166,6 +133,8 @@ struct DecodeRetentionMode {
 struct DecodeOptions {
     retention_mode: DecodeRetentionMode,
     known_hashes: Option<Vec<ObjectHash>>,
+    known_crcs: Option<Vec<u32>>,
+    known_offsets: Option<Vec<usize>>,
     expected_pack_hash: Option<ObjectHash>,
     verify_pack_stream_hash: bool,
     sync_base_callbacks: bool,
@@ -214,6 +183,8 @@ impl DecodeOptions {
         Self {
             retention_mode: DecodeRetentionMode::none(),
             known_hashes: None,
+            known_crcs: None,
+            known_offsets: None,
             expected_pack_hash: None,
             verify_pack_stream_hash: true,
             sync_base_callbacks: false,
@@ -269,9 +240,9 @@ impl<R, W> TeeReader<'_, R, W> {
                 "Pack file is too small to contain a trailer hash".to_string(),
             ));
         }
-        let payload_hash = ObjectHash::from_bytes(&self.payload_hash.finalize())
-            .map_err(|e| GitError::InvalidPackFile(format!("Read pack file error: {e}")))?;
-        let trailer_hash = ObjectHash::from_bytes(&self.hash_tail)
+        let kind = self.payload_hash.kind();
+        let payload_hash = self.payload_hash.finalize_object_hash();
+        let trailer_hash = ObjectHash::from_bytes_for_kind(kind, &self.hash_tail)
             .map_err(|e| GitError::InvalidPackFile(format!("Read pack file error: {e}")))?;
         Ok(PackHashCheck {
             payload_hash,
@@ -462,6 +433,22 @@ impl Pack {
         temp_path: Option<PathBuf>,
         clean_tmp: bool,
     ) -> Self {
+        Self::new_with_hash_kind(get_hash_kind(), thread_num, mem_limit, temp_path, clean_tmp)
+    }
+
+    /// Like [`Pack::new`], but for an explicit repository `hash_kind`.
+    ///
+    /// Every object ID, ref-delta base, pack trailer and idx checksum handled by this
+    /// pack is computed and parsed with `hash_kind`; worker threads spawned by the
+    /// decoder inherit it explicitly instead of reading their own thread-local.
+    /// [`Pack::new`] is the thread-local compatibility wrapper.
+    pub fn new_with_hash_kind(
+        hash_kind: HashKind,
+        thread_num: Option<usize>,
+        mem_limit: Option<usize>,
+        temp_path: Option<PathBuf>,
+        clean_tmp: bool,
+    ) -> Self {
         let mut temp_path = temp_path.unwrap_or(PathBuf::from(DEFAULT_TMP_DIR));
         // add 8 random characters as subdirectory, check if the directory exists
         loop {
@@ -497,8 +484,9 @@ impl Pack {
             }
         });
         Pack {
+            hash_kind,
             number: 0,
-            signature: ObjectHash::default(),
+            signature: ObjectHash::zero_for_kind(hash_kind),
             objects: Vec::new(),
             pool: Arc::new(ThreadPool::new(thread_num)),
             waitlist: Arc::new(Waitlist::new()),
@@ -654,6 +642,61 @@ impl Pack {
         }
     }
 
+    /// Inflate one compressed base object through a `kind` hasher **without retaining its
+    /// payload**, returning the canonical object ID and the number of compressed bytes consumed.
+    ///
+    /// Used wherever an idx-supplied object name must be verified for an object whose content
+    /// is not needed: the payload streams through a fixed scratch buffer, so the cost is one
+    /// inflate + one hash pass and no unbounded allocation.
+    pub(crate) fn hash_compressed_object(
+        pack: &mut impl BufRead,
+        obj_type: ObjectType,
+        expected_size: usize,
+        kind: HashKind,
+    ) -> Result<(ObjectHash, usize), GitError> {
+        let type_bytes = obj_type.to_bytes().ok_or_else(|| {
+            GitError::InvalidObjectType(format!(
+                "{obj_type} has no loose-object header and cannot be hashed as a base object"
+            ))
+        })?;
+        let mut hasher = HashAlgorithm::new_for_kind(kind);
+        hasher.update(type_bytes);
+        hasher.update(b" ");
+        hasher.update(expected_size.to_string().as_bytes());
+        hasher.update(b"\0");
+
+        let mut counting_reader = CountingReader::new(pack);
+        let mut deflate = ZlibDecoder::new(&mut counting_reader);
+        let mut remaining = expected_size;
+        let mut scratch = [0; SKIP_INFLATE_BUFFER_SIZE];
+        while remaining > 0 {
+            let chunk_len = remaining.min(scratch.len());
+            let bytes = deflate
+                .read(&mut scratch[..chunk_len])
+                .map_err(|e| GitError::InvalidPackFile(format!("Decompression error: {e}")))?;
+            if bytes == 0 {
+                return Err(GitError::InvalidPackFile(format!(
+                    "The object size is smaller than the expected size {expected_size}"
+                )));
+            }
+            hasher.update(&scratch[..bytes]);
+            remaining -= bytes;
+        }
+        let mut extra = [0; 1];
+        let extra_bytes = deflate
+            .read(&mut extra)
+            .map_err(|e| GitError::InvalidPackFile(format!("Decompression error: {e}")))?;
+        if extra_bytes != 0 {
+            return Err(GitError::InvalidPackFile(format!(
+                "The object size exceeds the expected size {expected_size}"
+            )));
+        }
+        let consumed = usize::try_from(counting_reader.bytes_read).map_err(|_| {
+            GitError::InvalidPackFile("Compressed object size exceeds platform limits".to_string())
+        })?;
+        Ok((hasher.finalize_object_hash(), consumed))
+    }
+
     fn skip_compressed_data(
         pack: &mut (impl BufRead + Send),
         expected_size: usize,
@@ -689,135 +732,49 @@ impl Pack {
         Ok(counting_reader.bytes_read as usize)
     }
 
-    fn read_be_u32(reader: &mut impl Read) -> io::Result<u32> {
-        let mut buf = [0; 4];
-        reader.read_exact(&mut buf)?;
-        Ok(u32::from_be_bytes(buf))
-    }
-
+    #[cfg(test)]
     fn read_be_u64(reader: &mut impl Read) -> io::Result<u64> {
         let mut buf = [0; 8];
         reader.read_exact(&mut buf)?;
         Ok(u64::from_be_bytes(buf))
     }
 
-    fn discard_exact(reader: &mut impl Read, mut len: usize) -> Result<(), GitError> {
-        let mut scratch = [0; 8192];
-        while len != 0 {
-            let n = len.min(scratch.len());
-            reader
-                .read_exact(&mut scratch[..n])
-                .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-            len -= n;
-        }
-        Ok(())
-    }
-
-    fn scan_decode_retention_from_index(pack_path: &Path) -> Result<DecodeScan, GitError> {
+    fn scan_decode_retention_from_index(
+        pack_path: &Path,
+        kind: HashKind,
+    ) -> Result<DecodeScan, GitError> {
         let idx_path = pack_path.with_extension("idx");
-        let idx_file = File::open(&idx_path)
-            .map_err(|e| GitError::InvalidPackFile(format!("Open pack index file error: {e}")))?;
-        let mut idx = HashingReader::new(io::BufReader::new(idx_file));
-
-        let magic = Pack::read_be_u32(&mut idx)
-            .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-        let version = Pack::read_be_u32(&mut idx)
-            .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-        if magic != 0xff74_4f63 || version != 2 {
-            return Err(GitError::InvalidPackFile(
-                "Only pack index v2 is supported for dependency scanning".to_string(),
-            ));
-        }
-
-        let mut object_num = 0usize;
-        for _ in 0..256 {
-            object_num = Pack::read_be_u32(&mut idx)
-                .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?
-                as usize;
-        }
-
-        let hash_size = get_hash_kind().size();
-        let mut objects_by_offset = Vec::with_capacity(object_num);
-        let mut hash_buf = vec![0; hash_size];
-        for _ in 0..object_num {
-            idx.read_exact(&mut hash_buf)
-                .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-            let hash = ObjectHash::from_bytes(&hash_buf)
-                .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-            objects_by_offset.push((0, hash));
-        }
-
-        let crc_bytes = object_num
-            .checked_mul(4)
-            .ok_or_else(|| GitError::InvalidPackFile("Pack index is too large".to_string()))?;
-        Self::discard_exact(&mut idx, crc_bytes)?;
-
-        let mut large_offset_slots = Vec::new();
-        for (pos, (object_offset, _)) in objects_by_offset.iter_mut().enumerate() {
-            let offset = Pack::read_be_u32(&mut idx)
-                .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-            if offset & 0x8000_0000 == 0 {
-                *object_offset = offset as u64;
-            } else {
-                large_offset_slots.push((pos, (offset & 0x7fff_ffff) as usize));
-            }
-        }
-
-        if !large_offset_slots.is_empty() {
-            let large_count = large_offset_slots
-                .iter()
-                .map(|(_, slot)| *slot)
-                .max()
-                .unwrap_or(0)
-                + 1;
-            let mut large_offsets = Vec::with_capacity(large_count);
-            for _ in 0..large_count {
-                large_offsets
-                    .push(Pack::read_be_u64(&mut idx).map_err(|e| {
-                        GitError::InvalidPackFile(format!("Read index error: {e}"))
-                    })?);
-            }
-            for (pos, slot) in large_offset_slots {
-                objects_by_offset[pos].0 = large_offsets[slot];
-            }
-        }
-
-        let mut objects_by_offset = objects_by_offset
+        let idx_file = File::open(&idx_path).map_err(|e| {
+            GitError::InvalidPackFile(format!(
+                "Pack index {} exists but cannot be read: {e}",
+                idx_path.display()
+            ))
+        })?;
+        let idx_len = idx_file
+            .metadata()
+            .map_err(|e| GitError::InvalidPackFile(format!("Read pack index metadata error: {e}")))?
+            .len();
+        // Shared, streaming, size-bounded idx reader (magic/version, fanout, names, CRCs,
+        // offsets incl. the 8-byte table, both checksums, no trailing data).
+        let parsed = pack_index::parse_idx_v2_from(io::BufReader::new(idx_file), kind, idx_len)?;
+        let object_num = parsed.entries.len();
+        let mut objects_by_offset = parsed
+            .entries
             .into_iter()
-            .map(|(offset, hash)| {
-                usize::try_from(offset)
-                    .map(|offset| (offset, hash))
+            .map(|entry| {
+                usize::try_from(entry.offset)
+                    .map(|offset| (offset, entry.hash, entry.crc32))
                     .map_err(|_| GitError::InvalidPackFile("Pack offset is too large".to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        objects_by_offset.sort_unstable_by_key(|(offset, _)| *offset);
-
-        let pack_hash = ObjectHash::from_stream(&mut idx)
-            .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-        let expected_idx_hash = idx.current_hash()?;
-        let idx_hash = {
-            let mut hash_buf = vec![0; hash_size];
-            idx.read_exact_without_hash(&mut hash_buf)
-                .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?;
-            ObjectHash::from_bytes(&hash_buf)
-                .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?
-        };
-        if idx_hash != expected_idx_hash {
+        objects_by_offset.sort_unstable_by_key(|(offset, _, _)| *offset);
+        if let Some(pair) = objects_by_offset.windows(2).find(|w| w[0].0 == w[1].0) {
             return Err(GitError::InvalidPackFile(format!(
-                "The pack index checksum {} does not match calculated checksum {}",
-                idx_hash, expected_idx_hash
+                "Pack index lists offset {} more than once",
+                pair[0].0
             )));
         }
-        let mut trailing = [0; 1];
-        if idx
-            .read_without_hash(&mut trailing)
-            .map_err(|e| GitError::InvalidPackFile(format!("Read index error: {e}")))?
-            != 0
-        {
-            return Err(GitError::InvalidPackFile(
-                "Pack index has trailing data after checksum".to_string(),
-            ));
-        }
+        let pack_hash = parsed.pack_hash;
 
         let pack_file = File::open(pack_path)
             .map_err(|e| GitError::InvalidPackFile(format!("Open pack file error: {e}")))?;
@@ -844,6 +801,7 @@ impl Pack {
                     &pack_file,
                     &objects_by_offset,
                     &retention,
+                    kind,
                 )?;
             } else {
                 let chunk_size = objects_by_offset.len().div_ceil(scan_threads);
@@ -854,7 +812,7 @@ impl Pack {
                         let retention = &retention;
                         handles.push(scope.spawn(move || {
                             Self::scan_object_dependencies_from_index_window(
-                                pack_file, chunk, retention,
+                                pack_file, chunk, retention, kind,
                             )
                         }));
                     }
@@ -871,21 +829,31 @@ impl Pack {
         }
         #[cfg(not(unix))]
         {
-            for &(object_offset, _) in &objects_by_offset {
+            for &(object_offset, _, _) in &objects_by_offset {
                 pack.seek(SeekFrom::Start(object_offset as u64))
                     .map_err(|e| GitError::InvalidPackFile(format!("Read pack file error: {e}")))?;
-                Self::scan_object_dependency(&mut pack, object_offset, &retention)?;
+                Self::scan_object_dependency(&mut pack, object_offset, &retention, kind)?;
             }
         }
 
+        let object_crcs = objects_by_offset
+            .iter()
+            .map(|(_, _, crc)| *crc)
+            .collect::<Vec<_>>();
+        let object_offsets = objects_by_offset
+            .iter()
+            .map(|(offset, _, _)| *offset)
+            .collect::<Vec<_>>();
         let object_hashes = objects_by_offset
             .into_iter()
-            .map(|(_, hash)| hash)
+            .map(|(_, hash, _)| hash)
             .collect::<Vec<_>>();
 
         Ok(DecodeScan {
             retention,
             object_hashes: Some(object_hashes),
+            object_crcs: Some(object_crcs),
+            object_offsets: Some(object_offsets),
             pack_hash: Some(pack_hash),
             pack_hash_check: None,
         })
@@ -894,14 +862,15 @@ impl Pack {
     #[cfg(unix)]
     fn scan_object_dependencies_from_index_window(
         pack_file: &File,
-        objects_by_offset: &[(usize, ObjectHash)],
+        objects_by_offset: &[(usize, ObjectHash, u32)],
         retention: &DecodeRetention,
+        kind: HashKind,
     ) -> Result<(), GitError> {
         let mut window = vec![0; PACK_SCAN_WINDOW_SIZE.max(PACK_OBJECT_PREFIX_READ_SIZE)];
         let mut window_start = 0usize;
         let mut window_len = 0usize;
 
-        for &(object_offset, _) in objects_by_offset {
+        for &(object_offset, _, _) in objects_by_offset {
             let required_end = object_offset.saturating_add(PACK_OBJECT_PREFIX_READ_SIZE);
             let window_end = window_start.saturating_add(window_len);
             if window_len == 0 || object_offset < window_start || required_end > window_end {
@@ -926,7 +895,7 @@ impl Pack {
                 ));
             }
             let mut object_prefix = Cursor::new(&window[prefix_start..prefix_start + prefix_len]);
-            Self::scan_object_dependency(&mut object_prefix, object_offset, retention)?;
+            Self::scan_object_dependency(&mut object_prefix, object_offset, retention, kind)?;
         }
 
         Ok(())
@@ -936,6 +905,7 @@ impl Pack {
         pack: &mut impl Read,
         init_offset: usize,
         retention: &DecodeRetention,
+        kind: HashKind,
     ) -> Result<(), GitError> {
         let mut offset = init_offset;
         let (type_bits, _) = utils::read_type_and_varint_size(pack, &mut offset)
@@ -955,7 +925,7 @@ impl Pack {
                 retention.add_offset_dependency(base_offset);
             }
             ObjectType::HashDelta => {
-                let ref_sha = ObjectHash::from_stream(pack)
+                let ref_sha = ObjectHash::from_stream_for_kind(kind, pack)
                     .map_err(|e| GitError::InvalidPackFile(format!("Read error: {e}")))?;
                 retention.add_hash_dependency(ref_sha);
             }
@@ -970,50 +940,10 @@ impl Pack {
         Ok(())
     }
 
-    fn hash_pack_file_payload(pack_path: &Path) -> Result<PackHashCheck, GitError> {
-        let file = File::open(pack_path)
-            .map_err(|e| GitError::InvalidPackFile(format!("Open pack file error: {e}")))?;
-        let len = file
-            .metadata()
-            .map_err(|e| GitError::InvalidPackFile(format!("Read pack metadata error: {e}")))?
-            .len();
-        let hash_size = get_hash_kind().size();
-        let hash_size_u64 = hash_size as u64;
-        if len < hash_size_u64 {
-            return Err(GitError::InvalidPackFile(
-                "Pack file is too small to contain a trailer hash".to_string(),
-            ));
-        }
-
-        let mut reader = io::BufReader::with_capacity(FILE_DECODE_BUFFER_SIZE, file);
-        let mut remaining = len - hash_size_u64;
-        let mut hasher = HashAlgorithm::new();
-        let mut scratch = vec![0; FILE_DECODE_BUFFER_SIZE];
-        while remaining > 0 {
-            let chunk_len = (remaining as usize).min(scratch.len());
-            reader
-                .read_exact(&mut scratch[..chunk_len])
-                .map_err(|e| GitError::InvalidPackFile(format!("Read pack file error: {e}")))?;
-            hasher.update(&scratch[..chunk_len]);
-            remaining -= chunk_len as u64;
-        }
-
-        let mut trailer = vec![0; hash_size];
-        reader
-            .read_exact(&mut trailer)
-            .map_err(|e| GitError::InvalidPackFile(format!("Read pack file error: {e}")))?;
-        let payload_hash = ObjectHash::from_bytes(&hasher.finalize())
-            .map_err(|e| GitError::InvalidPackFile(format!("Read pack file error: {e}")))?;
-        let trailer_hash = ObjectHash::from_bytes(&trailer)
-            .map_err(|e| GitError::InvalidPackFile(format!("Read pack file error: {e}")))?;
-
-        Ok(PackHashCheck {
-            payload_hash,
-            trailer_hash,
-        })
-    }
-
-    fn scan_decode_retention(pack: &mut (impl BufRead + Send)) -> Result<DecodeScan, GitError> {
+    fn scan_decode_retention(
+        pack: &mut (impl BufRead + Send),
+        kind: HashKind,
+    ) -> Result<DecodeScan, GitError> {
         let (object_num, _) = Pack::check_header(pack)?;
         let retention = DecodeRetention::default();
         let mut offset: usize = 12;
@@ -1040,9 +970,9 @@ impl Pack {
                     retention.add_offset_dependency(base_offset);
                 }
                 ObjectType::HashDelta => {
-                    let ref_sha = ObjectHash::from_stream(pack)
+                    let ref_sha = ObjectHash::from_stream_for_kind(kind, pack)
                         .map_err(|e| GitError::InvalidPackFile(format!("Read error: {e}")))?;
-                    offset += get_hash_kind().size();
+                    offset += kind.size();
                     retention.add_hash_dependency(ref_sha);
                 }
                 ObjectType::Commit | ObjectType::Tree | ObjectType::Blob | ObjectType::Tag => {}
@@ -1057,7 +987,7 @@ impl Pack {
             offset += raw_size;
         }
 
-        let mut trailer = vec![0; get_hash_kind().size()];
+        let mut trailer = vec![0; kind.size()];
         pack.read_exact(&mut trailer)
             .map_err(|e| GitError::InvalidPackFile(format!("Read error: {e}")))?;
         if !utils::is_eof(pack) {
@@ -1069,6 +999,8 @@ impl Pack {
         Ok(DecodeScan {
             retention,
             object_hashes: None,
+            object_crcs: None,
+            object_offsets: None,
             pack_hash: None,
             pack_hash_check: None,
         })
@@ -1077,16 +1009,17 @@ impl Pack {
     fn scan_decode_retention_and_copy(
         pack: &mut (impl BufRead + Send),
         writer: &mut (impl Write + Send),
+        kind: HashKind,
     ) -> Result<DecodeScan, GitError> {
         let mut tee = TeeReader {
             reader: pack,
             writer,
             write_error: None,
-            payload_hash: HashAlgorithm::new(),
-            hash_tail: Vec::with_capacity(get_hash_kind().size()),
-            hash_size: get_hash_kind().size(),
+            payload_hash: HashAlgorithm::new_for_kind(kind),
+            hash_tail: Vec::with_capacity(kind.size()),
+            hash_size: kind.size(),
         };
-        let mut scan = Pack::scan_decode_retention(&mut tee)?;
+        let mut scan = Pack::scan_decode_retention(&mut tee, kind)?;
         tee.check_write_error()
             .map_err(|e| GitError::InvalidPackFile(format!("Write temp pack file error: {e}")))?;
         scan.pack_hash_check = Some(tee.finish_pack_hash_check()?);
@@ -1108,16 +1041,30 @@ impl Pack {
         pack: &mut (impl BufRead + Send),
         offset: &mut usize,
     ) -> Result<Option<CacheObject>, GitError> {
-        Self::decode_pack_object_with_crc(pack, offset, true, false, false, None, None)
+        Self::decode_pack_object_with_kind(get_hash_kind(), pack, offset)
     }
 
+    /// Like [`Pack::decode_pack_object`], but the object ID width, ref-delta base ID and
+    /// the computed object hash all follow the explicit repository `kind`
+    /// ([`Pack::decode_pack_object`] is the thread-local compatibility wrapper).
+    pub fn decode_pack_object_with_kind(
+        kind: HashKind,
+        pack: &mut (impl BufRead + Send),
+        offset: &mut usize,
+    ) -> Result<Option<CacheObject>, GitError> {
+        Self::decode_pack_object_with_crc(kind, pack, offset, true, false, false, None, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn decode_pack_object_with_crc(
+        kind: HashKind,
         pack: &mut (impl BufRead + Send),
         offset: &mut usize,
         track_crc: bool,
         skip_unneeded_objects: bool,
         emit_skipped_base_callback: bool,
         known_hash: Option<ObjectHash>,
+        known_crc: Option<u32>,
         retention: Option<&DecodeRetention>,
     ) -> Result<Option<CacheObject>, GitError> {
         let init_offset = *offset;
@@ -1144,14 +1091,28 @@ impl Pack {
         match t {
             ObjectType::Commit | ObjectType::Tree | ObjectType::Blob | ObjectType::Tag => {
                 if Self::should_skip_no_callback_object(
-                    track_crc,
                     skip_unneeded_objects,
                     known_hash,
                     retention,
                     init_offset,
                 ) {
-                    let raw_size = Pack::skip_compressed_data(&mut reader, size)?;
+                    // The payload is not retained, but the idx-supplied name that justified the
+                    // skip is still verified against the streamed content hash (fail-closed on
+                    // object/index mismatch); only the buffer allocation is avoided.
+                    let raw_size = match known_hash {
+                        Some(expected) => {
+                            let (computed, raw_size) =
+                                Self::hash_compressed_object(&mut reader, t, size, kind)?;
+                            Self::verify_known_hash(init_offset, computed, Some(expected))?;
+                            raw_size
+                        }
+                        None => Pack::skip_compressed_data(&mut reader, size)?,
+                    };
                     *offset += raw_size;
+                    // The skipped object's compressed bytes still went through the CRC
+                    // reader: verify them against the idx CRC like any other object.
+                    let crc32 = reader.crc32();
+                    Self::verify_known_crc(track_crc, init_offset, crc32, known_crc)?;
                     if emit_skipped_base_callback {
                         let hash = known_hash.ok_or_else(|| {
                             GitError::InvalidPackFile(
@@ -1161,7 +1122,7 @@ impl Pack {
                         return Ok(Some(CacheObject {
                             info: CacheObjectInfo::BaseObject(t, hash),
                             offset: init_offset,
-                            crc32: 0,
+                            crc32,
                             data_decompressed: Vec::new(),
                             mem_recorder: None,
                             is_delta_in_pack: false,
@@ -1174,7 +1135,11 @@ impl Pack {
                 let (data, raw_size) = Pack::decompress_data(&mut reader, size)?;
                 *offset += raw_size;
                 let crc32 = reader.crc32();
-                let hash = known_hash.unwrap_or_else(|| utils::calculate_object_hash(t, &data));
+                Self::verify_known_crc(track_crc, init_offset, crc32, known_crc)?;
+                // The content hash is always recomputed with the repository kind; an idx-supplied
+                // name is verified against it, never trusted (fail-closed on object/index mismatch).
+                let hash = utils::calculate_object_hash_for_kind(kind, t, &data)?;
+                Self::verify_known_hash(init_offset, hash, known_hash)?;
                 Ok(Some(CacheObject {
                     info: CacheObjectInfo::BaseObject(t, hash),
                     offset: init_offset,
@@ -1199,65 +1164,10 @@ impl Pack {
                     GitError::InvalidObjectInfo("Invalid OffsetDelta offset".to_string())
                 })?;
 
-                if emit_skipped_base_callback
-                    && Self::should_skip_no_callback_object(
-                        false,
-                        skip_unneeded_objects,
-                        known_hash,
-                        retention,
-                        init_offset,
-                    )
-                {
-                    let raw_size = Pack::skip_compressed_data(&mut reader, size)?;
-                    *offset += raw_size;
-
-                    let obj_info = match t {
-                        ObjectType::OffsetDelta => CacheObjectInfo::OffsetDelta(base_offset, 0),
-                        ObjectType::OffsetZstdelta => {
-                            CacheObjectInfo::OffsetZstdelta(base_offset, 0)
-                        }
-                        _ => unreachable!(),
-                    };
-                    return Ok(Some(CacheObject {
-                        info: obj_info,
-                        offset: init_offset,
-                        crc32: 0,
-                        data_decompressed: Vec::new(),
-                        mem_recorder: None,
-                        is_delta_in_pack: true,
-                        known_hash,
-                    }));
-                }
-
-                if !emit_skipped_base_callback
-                    && Self::should_skip_no_callback_object(
-                        track_crc,
-                        skip_unneeded_objects,
-                        known_hash,
-                        retention,
-                        init_offset,
-                    )
-                {
-                    let raw_size = Pack::skip_compressed_data(&mut reader, size)?;
-                    *offset += raw_size;
-
-                    let obj_info = match t {
-                        ObjectType::OffsetDelta => CacheObjectInfo::OffsetDelta(base_offset, 0),
-                        ObjectType::OffsetZstdelta => {
-                            CacheObjectInfo::OffsetZstdelta(base_offset, 0)
-                        }
-                        _ => unreachable!(),
-                    };
-                    return Ok(Some(CacheObject {
-                        info: obj_info,
-                        offset: init_offset,
-                        crc32: 0,
-                        data_decompressed: Vec::new(),
-                        mem_recorder: None,
-                        is_delta_in_pack: true,
-                        known_hash,
-                    }));
-                }
+                // Delta payloads are never skipped (no-callback and low-memory callback modes
+                // alike): an idx-supplied name for a delta can only be verified by rebuilding it
+                // (see `verify_known_hash` in `rebuild_*_with_hash`), so the delta is always
+                // decoded and resolved.
 
                 let (data, raw_size) = Pack::decompress_data(&mut reader, size)?;
                 *offset += raw_size;
@@ -1275,6 +1185,7 @@ impl Pack {
                     _ => unreachable!(),
                 };
                 let crc32 = reader.crc32();
+                Self::verify_known_crc(track_crc, init_offset, crc32, known_crc)?;
                 Ok(Some(CacheObject {
                     info: obj_info,
                     offset: init_offset,
@@ -1287,57 +1198,14 @@ impl Pack {
             }
             ObjectType::HashDelta => {
                 // Read hash bytes to get the reference object hash(size depends on hash kind,e.g.,20 for SHA1,32 for SHA256)
-                let ref_sha = ObjectHash::from_stream(&mut reader).map_err(|e| {
+                let ref_sha = ObjectHash::from_stream_for_kind(kind, &mut reader).map_err(|e| {
                     GitError::InvalidPackFile(format!("Read hash-delta base hash error: {e}"))
                 })?;
-                // Offset is incremented by 20/32 bytes
-                *offset += get_hash_kind().size();
+                // Offset is incremented by the ID width of `kind` (20 or 32 bytes)
+                *offset += kind.size();
 
-                if emit_skipped_base_callback
-                    && Self::should_skip_no_callback_object(
-                        false,
-                        skip_unneeded_objects,
-                        known_hash,
-                        retention,
-                        init_offset,
-                    )
-                {
-                    let raw_size = Pack::skip_compressed_data(&mut reader, size)?;
-                    *offset += raw_size;
-
-                    return Ok(Some(CacheObject {
-                        info: CacheObjectInfo::HashDelta(ref_sha, 0),
-                        offset: init_offset,
-                        crc32: 0,
-                        data_decompressed: Vec::new(),
-                        mem_recorder: None,
-                        is_delta_in_pack: true,
-                        known_hash,
-                    }));
-                }
-
-                if !emit_skipped_base_callback
-                    && Self::should_skip_no_callback_object(
-                        track_crc,
-                        skip_unneeded_objects,
-                        known_hash,
-                        retention,
-                        init_offset,
-                    )
-                {
-                    let raw_size = Pack::skip_compressed_data(&mut reader, size)?;
-                    *offset += raw_size;
-
-                    return Ok(Some(CacheObject {
-                        info: CacheObjectInfo::HashDelta(ref_sha, 0),
-                        offset: init_offset,
-                        crc32: 0,
-                        data_decompressed: Vec::new(),
-                        mem_recorder: None,
-                        is_delta_in_pack: true,
-                        known_hash,
-                    }));
-                }
+                // Delta payloads are never skipped (see the offset-delta arm): the name can only
+                // be verified after the delta is rebuilt.
 
                 let (data, raw_size) = Pack::decompress_data(&mut reader, size)?;
                 *offset += raw_size;
@@ -1346,6 +1214,7 @@ impl Pack {
                 let (_, final_size) = utils::read_delta_object_size(&mut delta_reader)?;
 
                 let crc32 = reader.crc32();
+                Self::verify_known_crc(track_crc, init_offset, crc32, known_crc)?;
 
                 Ok(Some(CacheObject {
                     info: CacheObjectInfo::HashDelta(ref_sha, final_size),
@@ -1366,14 +1235,17 @@ impl Pack {
         }
     }
 
+    /// Whether a base object may be streamed through the hasher and dropped instead of being
+    /// decoded: only in a skip-unneeded mode, only with an idx-supplied name, and only when
+    /// nothing in the pack depends on it. CRC tracking does not affect the decision — the
+    /// skipped bytes go through the CRC reader too.
     fn should_skip_no_callback_object(
-        track_crc: bool,
         skip_unneeded_objects: bool,
         known_hash: Option<ObjectHash>,
         retention: Option<&DecodeRetention>,
         offset: usize,
     ) -> bool {
-        if track_crc || !skip_unneeded_objects {
+        if !skip_unneeded_objects {
             return false;
         }
 
@@ -1432,7 +1304,8 @@ impl Pack {
             let scan = {
                 let mut temp_writer =
                     io::BufWriter::with_capacity(FILE_DECODE_BUFFER_SIZE, &mut temp_pack);
-                let scan = Pack::scan_decode_retention_and_copy(pack, &mut temp_writer)?;
+                let scan =
+                    Pack::scan_decode_retention_and_copy(pack, &mut temp_writer, self.hash_kind)?;
                 temp_writer.flush().map_err(|e| {
                     GitError::InvalidPackFile(format!("Flush temp pack file error: {e}"))
                 })?;
@@ -1554,6 +1427,11 @@ impl Pack {
     /// Use this when the caller only needs validation, hashing, and cache/delta reconstruction side
     /// effects. This preserves `decode` for callers that consume each decoded object, while avoiding
     /// one full object-data clone per completed object on the no-callback path.
+    ///
+    /// Integrity: the pack trailer, an existing `.idx` (magic/version, fanout, checksums, object
+    /// count) and the name of every object are verified: base objects that are not needed are
+    /// streamed through the hasher and dropped, and every delta (leaf deltas included) is rebuilt
+    /// so its idx-supplied name is checked against the rebuilt content.
     pub fn decode_without_callback<C>(
         &mut self,
         pack: &mut (impl BufRead + Send),
@@ -1662,13 +1540,27 @@ impl Pack {
     where
         C: FnOnce(ObjectHash) + Send + 'static,
     {
-        let scan = match Pack::scan_decode_retention_from_index(pack_path) {
-            Ok(scan) => scan,
-            Err(_) => {
+        // An existing idx must be valid for this repository kind (magic/version, object names,
+        // both checksums, object count): any mismatch fails closed instead of silently falling
+        // back to a full scan. Only a *missing* idx selects the scan path.
+        let idx_path = pack_path.with_extension("idx");
+        // `symlink_metadata` (not `metadata`): a dangling `.idx` symlink counts as present and
+        // then fails to open, instead of being mistaken for a missing idx.
+        let scan = match std::fs::symlink_metadata(&idx_path) {
+            Ok(_) => Pack::scan_decode_retention_from_index(pack_path, self.hash_kind)?,
+            // Only a genuinely missing idx selects the scan path; an unreadable, dangling or
+            // otherwise inaccessible idx is an error (fail-closed), never a silent fallback.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let scan_file = File::open(pack_path)
                     .map_err(|e| GitError::InvalidPackFile(format!("Open pack file error: {e}")))?;
                 let mut scan_reader = io::BufReader::new(scan_file);
-                Pack::scan_decode_retention(&mut scan_reader)?
+                Pack::scan_decode_retention(&mut scan_reader, self.hash_kind)?
+            }
+            Err(e) => {
+                return Err(GitError::InvalidPackFile(format!(
+                    "Pack index {} exists but cannot be read: {e}",
+                    idx_path.display()
+                )));
             }
         };
         self.decode_file_inner_with_scan(
@@ -1696,6 +1588,8 @@ impl Pack {
         let DecodeScan {
             retention,
             object_hashes: known_hashes,
+            object_crcs: known_crcs,
+            object_offsets: known_offsets,
             pack_hash,
             pack_hash_check,
         } = scan;
@@ -1706,19 +1600,13 @@ impl Pack {
             FileDecodeMode::RetainAll => DecodeRetentionMode::retain_all(retention),
             FileDecodeMode::SkipUnneeded => DecodeRetentionMode::skip_unneeded(retention),
         };
-        let skip_payload_hash_check = callback.is_some() && Self::low_memory_callback_entries();
-        let hash_check =
-            if !skip_payload_hash_check && pack_hash.is_some() && pack_hash_check.is_none() {
-                let pack_path = pack_path.to_path_buf();
-                let kind: HashKind = get_hash_kind();
-                Some(thread::spawn(move || {
-                    set_hash_kind(kind);
-                    Pack::hash_pack_file_payload(&pack_path)
-                }))
-            } else {
-                None
-            };
-
+        // The pack payload hash is recomputed and checked against the trailer (and the
+        // idx-copied pack hash) in every mode, the low-memory callback mode included: an idx
+        // can only vouch for the trailer bytes, never for the payload that precedes them. The
+        // hash is taken inline by the decode reader (`Wrapper::new_with_kind`) in the same
+        // pass that decodes the objects — never by a second read of the pack (GC-10). Only the
+        // stream path, which already hashed the payload while copying it to the temp file
+        // (`pack_hash_check`), skips the inline hash.
         let file = File::open(pack_path)
             .map_err(|e| GitError::InvalidPackFile(format!("Open pack file error: {e}")))?;
         let mut reader = io::BufReader::with_capacity(FILE_DECODE_BUFFER_SIZE, file);
@@ -1729,25 +1617,16 @@ impl Pack {
             DecodeOptions {
                 retention_mode,
                 known_hashes,
+                known_crcs,
+                known_offsets,
                 expected_pack_hash,
-                verify_pack_stream_hash: !skip_payload_hash_check
-                    && hash_check.is_none()
-                    && pack_hash_check.is_none(),
+                verify_pack_stream_hash: pack_hash_check.is_none(),
                 sync_base_callbacks,
             },
         );
 
-        let hash_result = hash_check.map(|handle| {
-            handle
-                .join()
-                .map_err(|_| GitError::InvalidPackFile("Pack hash check panicked".to_string()))?
-        });
-
         decode_result?;
         if let Some(hash_check) = pack_hash_check {
-            Self::verify_pack_hash_check(&hash_check, self.signature)?;
-        } else if let Some(hash_check) = hash_result {
-            let hash_check = hash_check?;
             Self::verify_pack_hash_check(&hash_check, self.signature)?;
         }
 
@@ -1786,6 +1665,8 @@ impl Pack {
         let DecodeOptions {
             retention_mode,
             known_hashes,
+            known_crcs,
+            known_offsets,
             expected_pack_hash,
             verify_pack_stream_hash,
             sync_base_callbacks,
@@ -1804,8 +1685,13 @@ impl Pack {
                 pack.caches.memory_used() / 1024 / 1024
             );
         };
-        let track_crc = callback.is_some() && !Self::low_memory_callback_entries();
+        // CRCs are tracked whenever a consumer wants them (callback) or an idx supplied them
+        // (verification), in every mode including the low-memory callback mode; each object's
+        // compressed bytes are checked against the idx CRC inside `decode_pack_object_with_crc`.
+        let track_crc = callback.is_some() || known_crcs.is_some();
         let known_hashes = known_hashes.as_deref();
+        let known_crcs = known_crcs.as_deref();
+        let known_offsets = known_offsets.as_deref();
         let shared_params = Arc::new(SharedParams {
             pool: self.pool.clone(),
             waitlist: self.waitlist.clone(),
@@ -1817,7 +1703,7 @@ impl Pack {
             error: Mutex::new(None),
         });
         let mut reader = if verify_pack_stream_hash {
-            Wrapper::new(pack)
+            Wrapper::new_with_kind(pack, self.hash_kind)
         } else {
             Wrapper::new_without_hash(pack)
         };
@@ -1861,14 +1747,27 @@ impl Pack {
                     thread::yield_now();
                 }
             }
+            // The idx entry paired with object i must point at the object's real start: an
+            // idx whose offsets are permuted or point inside objects is rejected here even if
+            // its checksums verify (names and CRCs are checked per object below).
+            if let Some(expected) = known_offsets.and_then(|offsets| offsets.get(i).copied())
+                && expected != offset
+            {
+                self.abort_decode();
+                return Err(GitError::InvalidPackFile(format!(
+                    "Pack object {i} starts at offset {offset} but the pack index records offset {expected}"
+                )));
+            }
             let known_hash = known_hashes.and_then(|hashes| hashes.get(i).copied());
             let r: Result<Option<CacheObject>, GitError> = Pack::decode_pack_object_with_crc(
+                self.hash_kind,
                 &mut reader,
                 &mut offset,
                 track_crc,
                 shared_params.skip_unneeded_objects,
                 shared_params.callback.is_some() && Self::low_memory_callback_entries(),
                 known_hash,
+                known_crcs.and_then(|crcs| crcs.get(i).copied()),
                 shared_params.retention.as_deref(),
             );
             match r {
@@ -1882,11 +1781,6 @@ impl Pack {
                         continue;
                     };
 
-                    if Self::should_skip_no_callback_delta(&shared_params, &obj) {
-                        Self::process_delta_dependency(shared_params.clone(), obj);
-                        i += 1;
-                        continue;
-                    }
                     if matches!(obj.info, CacheObjectInfo::BaseObject(_, _))
                         && Self::should_drop_no_callback_base(&shared_params, &obj)
                     {
@@ -1906,7 +1800,7 @@ impl Pack {
                     }
 
                     let params = shared_params.clone();
-                    let kind = get_hash_kind();
+                    let kind = self.hash_kind;
                     self.pool.execute(move || {
                         set_hash_kind(kind);
                         match obj.info {
@@ -1931,7 +1825,7 @@ impl Pack {
         }
         log_info(i, self);
         let render_hash = verify_pack_stream_hash.then(|| reader.final_hash());
-        self.signature = match ObjectHash::from_stream(&mut reader) {
+        self.signature = match ObjectHash::from_stream_for_kind(self.hash_kind, &mut reader) {
             Ok(signature) => signature,
             Err(e) => {
                 self.abort_decode();
@@ -1982,10 +1876,40 @@ impl Pack {
         }
         // !Attention: Caches threadpool may not stop, but it's not a problem (garbage file data)
         // So that files != self.number
-        assert_eq!(self.waitlist.map_offset.len(), 0);
-        assert_eq!(self.waitlist.map_ref.len(), 0);
+        // Fail closed on a thin or malformed pack: a delta whose base never appeared (a
+        // ref-delta base outside the pack, or an offset-delta pointing at a non-object
+        // offset) is still waiting here. Return an error instead of panicking.
+        let pending_offset = self.waitlist.map_offset.len();
+        let pending_ref = self.waitlist.map_ref.len();
+        if pending_offset != 0 || pending_ref != 0 {
+            let first_offset = self
+                .waitlist
+                .map_offset
+                .iter()
+                .next()
+                .map(|entry| format!("; first missing base offset {}", entry.key()))
+                .unwrap_or_default();
+            let first_ref = self
+                .waitlist
+                .map_ref
+                .iter()
+                .next()
+                .map(|entry| format!("; first missing base object {}", entry.key()))
+                .unwrap_or_default();
+            self.abort_decode();
+            return Err(GitError::InvalidPackFile(format!(
+                "Pack references bases that are not in the pack (thin pack?): {pending_offset} offset-delta and {pending_ref} ref-delta object(s) unresolved{first_offset}{first_ref}"
+            )));
+        }
         // Because we may skip some objects (e.g. AI objects), we use >= instead of ==
-        assert!(self.number >= self.caches.total_inserted());
+        if self.number < self.caches.total_inserted() {
+            self.abort_decode();
+            return Err(GitError::InvalidPackFile(format!(
+                "Pack header declares {} objects but {} were decoded",
+                self.number,
+                self.caches.total_inserted()
+            )));
+        }
         tracing::info!(
             "The pack file has been decoded successfully, takes: [ {:?} ]",
             time.elapsed()
@@ -2008,7 +1932,7 @@ impl Pack {
         mut pack: impl BufRead + Send + 'static,
         sender: UnboundedSender<Entry>,
     ) -> JoinHandle<Pack> {
-        let kind = get_hash_kind();
+        let kind = self.hash_kind;
         thread::spawn(move || {
             set_hash_kind(kind);
             self.decode(
@@ -2032,7 +1956,7 @@ impl Pack {
         sender: UnboundedSender<MetaAttached<Entry, EntryMeta>>,
         pack_hash_send: Option<UnboundedSender<ObjectHash>>,
     ) -> Self {
-        let kind = get_hash_kind();
+        let kind = self.hash_kind;
         let (tx, rx) = std::sync::mpsc::channel();
         let mut reader = StreamBufReader::new(rx);
         tokio::spawn(async move {
@@ -2166,33 +2090,6 @@ impl Pack {
         }
     }
 
-    fn should_skip_no_callback_delta(
-        shared_params: &SharedParams,
-        delta_obj: &CacheObject,
-    ) -> bool {
-        if shared_params.callback.is_some() {
-            return false;
-        }
-
-        if !shared_params.skip_unneeded_objects {
-            return false;
-        }
-
-        let Some(retention) = &shared_params.retention else {
-            return false;
-        };
-        let Some(hash) = delta_obj.known_hash else {
-            return false;
-        };
-
-        !retention.should_retain(delta_obj.offset, hash)
-            && !shared_params
-                .waitlist
-                .map_offset
-                .contains_key(&delta_obj.offset)
-            && !shared_params.waitlist.map_ref.contains_key(&hash)
-    }
-
     fn should_drop_no_callback_base(shared_params: &SharedParams, base_obj: &CacheObject) -> bool {
         if shared_params.callback.is_some() {
             return false;
@@ -2254,23 +2151,15 @@ impl Pack {
         delta_obj: CacheObject,
         base_obj: Arc<CacheObject>,
     ) {
-        if Self::should_skip_no_callback_delta(&shared_params, &delta_obj) {
-            return;
-        }
-
-        if Self::try_callback_unneeded_low_memory_delta(&shared_params, &delta_obj, &base_obj) {
-            return;
-        }
-
         shared_params.pool.clone().execute(move || {
             let known_hash = delta_obj.known_hash;
             let new_obj = match delta_obj.info {
                 CacheObjectInfo::OffsetDelta(_, _) | CacheObjectInfo::HashDelta(_, _) => {
                     Pack::rebuild_delta_with_hash(delta_obj, base_obj, known_hash)
                 }
-                CacheObjectInfo::OffsetZstdelta(_, _) => Ok(Pack::rebuild_zstdelta_with_hash(
-                    delta_obj, base_obj, known_hash,
-                )),
+                CacheObjectInfo::OffsetZstdelta(_, _) => {
+                    Pack::rebuild_zstdelta_with_hash(delta_obj, base_obj, known_hash)
+                }
                 _ => unreachable!(),
             };
 
@@ -2289,58 +2178,6 @@ impl Pack {
             new_obj.record_mem_size();
             Self::cache_obj_and_process_waitlist(&shared_params, new_obj); //Indirect Recursion
         });
-    }
-
-    fn try_callback_unneeded_low_memory_delta(
-        shared_params: &SharedParams,
-        delta_obj: &CacheObject,
-        base_obj: &CacheObject,
-    ) -> bool {
-        if !Self::low_memory_callback_entries() {
-            return false;
-        }
-
-        let (Some(callback), Some(retention), Some(hash)) = (
-            shared_params.callback.as_ref(),
-            shared_params.retention.as_ref(),
-            delta_obj.known_hash,
-        ) else {
-            return false;
-        };
-
-        if retention.should_retain(delta_obj.offset, hash)
-            || shared_params.waitlist.has_waiters(delta_obj.offset, hash)
-        {
-            return false;
-        }
-
-        callback(Self::low_memory_delta_callback_entry(
-            delta_obj,
-            base_obj.object_type(),
-            hash,
-        ));
-        true
-    }
-
-    fn low_memory_delta_callback_entry(
-        delta_obj: &CacheObject,
-        obj_type: ObjectType,
-        hash: ObjectHash,
-    ) -> MetaAttached<Entry, EntryMeta> {
-        MetaAttached {
-            inner: Entry {
-                obj_type,
-                data: Vec::new(),
-                hash,
-                chain_len: 0,
-            },
-            meta: EntryMeta {
-                pack_offset: Some(delta_obj.offset),
-                crc32: Some(delta_obj.crc32),
-                is_delta: Some(delta_obj.is_delta_in_pack),
-                ..Default::default()
-            },
-        }
     }
 
     /// Cache the new object & process the objects waiting for it (in multi-threading).
@@ -2396,6 +2233,42 @@ impl Pack {
         Self::rebuild_delta_with_hash(delta_obj, base_obj, None)
     }
 
+    /// Fail closed when an idx-supplied object name disagrees with the recomputed content hash.
+    /// When CRCs are tracked, the CRC of an object's compressed pack bytes must match the CRC
+    /// the idx records for it (fail-closed on object/index mismatch).
+    fn verify_known_crc(
+        track_crc: bool,
+        offset: usize,
+        computed: u32,
+        known_crc: Option<u32>,
+    ) -> Result<(), GitError> {
+        match known_crc {
+            Some(expected) if track_crc && computed != expected => {
+                Err(GitError::InvalidPackFile(format!(
+                    "Object at offset {offset} has CRC32 {computed:#010x} but the pack index records {expected:#010x}"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn verify_known_hash(
+        offset: usize,
+        computed: ObjectHash,
+        known_hash: Option<ObjectHash>,
+    ) -> Result<(), GitError> {
+        match known_hash {
+            Some(expected) if expected != computed => Err(GitError::InvalidPackFile(format!(
+                "Object at offset {offset} hashes to {} ({}) but the pack index names it {} ({})",
+                computed,
+                computed.kind(),
+                expected,
+                expected.kind()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     fn rebuild_delta_with_hash(
         delta_obj: CacheObject,
         base_obj: Arc<CacheObject>,
@@ -2405,8 +2278,17 @@ impl Pack {
         let result = crate::delta::delta_decode(&mut stream, &base_obj.data_decompressed)
             .map_err(|error| GitError::DeltaObjectError(error.to_string()))?;
 
-        let hash = known_hash
-            .unwrap_or_else(|| utils::calculate_object_hash(base_obj.object_type(), &result));
+        // The rebuilt object belongs to the same repository as its base: take the kind from
+        // the base's own ID, never from the worker's thread-local. An idx-supplied name is
+        // verified against the recomputed hash, never trusted.
+        let kind = base_obj
+            .base_object_hash()
+            .ok_or_else(|| {
+                GitError::DeltaObjectError("delta base is not a resolved base object".to_string())
+            })?
+            .kind();
+        let hash = utils::calculate_object_hash_for_kind(kind, base_obj.object_type(), &result)?;
+        Self::verify_known_hash(delta_obj.offset, hash, known_hash)?;
         // create new obj from `delta_obj` & `result` instead of modifying `delta_obj` for heap-size recording
         Ok(CacheObject {
             info: CacheObjectInfo::BaseObject(base_obj.object_type(), hash),
@@ -2419,20 +2301,33 @@ impl Pack {
         }) // Canonical form (Complete Object)
         // Memory recording will happen after this function returns. See `process_delta`
     }
-    pub fn rebuild_zstdelta(delta_obj: CacheObject, base_obj: Arc<CacheObject>) -> CacheObject {
+    /// Rebuild a zstdelta on top of a resolved base object. The rebuilt object's ID is
+    /// computed with the base object's own hash kind; a base without a resolved ID or a
+    /// failing zstdelta application is an error, never a panic or a thread-local fallback.
+    pub fn rebuild_zstdelta(
+        delta_obj: CacheObject,
+        base_obj: Arc<CacheObject>,
+    ) -> Result<CacheObject, GitError> {
         Self::rebuild_zstdelta_with_hash(delta_obj, base_obj, None)
     }
 
+    /// Rebuild a zstdelta and verify an idx-supplied name against the recomputed hash.
     fn rebuild_zstdelta_with_hash(
         delta_obj: CacheObject,
         base_obj: Arc<CacheObject>,
         known_hash: Option<ObjectHash>,
-    ) -> CacheObject {
+    ) -> Result<CacheObject, GitError> {
         let result = zstdelta::apply(&base_obj.data_decompressed, &delta_obj.data_decompressed)
-            .expect("Failed to apply zstdelta");
-        let hash = known_hash
-            .unwrap_or_else(|| utils::calculate_object_hash(base_obj.object_type(), &result));
-        CacheObject {
+            .map_err(|e| GitError::DeltaObjectError(format!("Failed to apply zstdelta: {e}")))?;
+        let kind = base_obj
+            .base_object_hash()
+            .ok_or_else(|| {
+                GitError::DeltaObjectError("delta base is not a resolved base object".to_string())
+            })?
+            .kind();
+        let hash = utils::calculate_object_hash_for_kind(kind, base_obj.object_type(), &result)?;
+        Self::verify_known_hash(delta_obj.offset, hash, known_hash)?;
+        Ok(CacheObject {
             info: CacheObjectInfo::BaseObject(base_obj.object_type(), hash),
             offset: delta_obj.offset,
             crc32: delta_obj.crc32,
@@ -2440,7 +2335,7 @@ impl Pack {
             mem_recorder: None,
             is_delta_in_pack: delta_obj.is_delta_in_pack,
             known_hash: None,
-        } // Canonical form (Complete Object)
+        }) // Canonical form (Complete Object)
         // Memory recording will happen after this function returns. See `process_delta`
     }
 }
@@ -2626,10 +2521,12 @@ mod tests {
         assert_eq!(with_crc.crc32, expected_crc);
         assert_eq!(with_crc.data_decompressed, b"a");
 
-        let mut no_crc_reader = Cursor::new(object_data);
+        let mut no_crc_reader = Cursor::new(object_data.clone());
         let mut offset = 0;
-        let supplied_hash = ObjectHash::new(b"known-hash-from-idx");
+        // An idx-supplied name is verified against the recomputed content hash.
+        let supplied_hash = utils::calculate_object_hash(ObjectType::Blob, b"a");
         let without_crc = Pack::decode_pack_object_with_crc(
+            get_hash_kind(),
             &mut no_crc_reader,
             &mut offset,
             false,
@@ -2637,12 +2534,30 @@ mod tests {
             false,
             Some(supplied_hash),
             None,
+            None,
         )
         .unwrap()
         .unwrap();
         assert_eq!(without_crc.crc32, 0);
         assert_eq!(without_crc.data_decompressed, b"a");
         assert_eq!(without_crc.base_object_hash(), Some(supplied_hash));
+
+        // A wrong idx-supplied name fails closed instead of being trusted.
+        let mut reader = Cursor::new(object_data);
+        let mut offset = 0;
+        let err = Pack::decode_pack_object_with_crc(
+            get_hash_kind(),
+            &mut reader,
+            &mut offset,
+            false,
+            false,
+            false,
+            Some(ObjectHash::new(b"known-hash-from-idx")),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pack index names it"), "{err}");
     }
 
     #[test]
@@ -2656,17 +2571,20 @@ mod tests {
         object_data.push(0x31);
         object_data.extend_from_slice(&compressed);
 
-        let supplied_hash = ObjectHash::new(b"known-hash-from-idx");
+        // The skipped object's idx name is verified by streaming the payload through the hasher.
+        let supplied_hash = utils::calculate_object_hash(ObjectType::Blob, b"a");
         let retention = super::DecodeRetention::default();
         let mut reader = Cursor::new(object_data);
         let mut offset = 0;
         let skipped = Pack::decode_pack_object_with_crc(
+            get_hash_kind(),
             &mut reader,
             &mut offset,
             false,
             true,
             true,
             Some(supplied_hash),
+            None,
             Some(&retention),
         )
         .unwrap()
@@ -2676,12 +2594,30 @@ mod tests {
         assert!(skipped.data_decompressed.is_empty());
         assert_eq!(skipped.base_object_hash(), Some(supplied_hash));
         assert_eq!(offset, reader.get_ref().len());
+
+        // A wrong idx name for a skipped object is rejected instead of being emitted.
+        let mut reader = Cursor::new(reader.into_inner());
+        let mut offset = 0;
+        let err = Pack::decode_pack_object_with_crc(
+            get_hash_kind(),
+            &mut reader,
+            &mut offset,
+            false,
+            true,
+            true,
+            Some(ObjectHash::new(b"known-hash-from-idx")),
+            None,
+            Some(&retention),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pack index names it"), "{err}");
     }
 
     #[test]
-    fn test_decode_pack_object_can_skip_unneeded_delta_payload() {
+    fn test_decode_pack_object_never_skips_delta_payload() {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        // Delta header: base size 0x61, result size 0x62, one trailing byte.
         encoder.write_all(b"abc").unwrap();
         let compressed = encoder.finish().unwrap();
 
@@ -2692,52 +2628,273 @@ mod tests {
 
         let supplied_hash = ObjectHash::new(b"known-leaf-delta-hash");
         let retention = super::DecodeRetention::default();
-        let mut reader = Cursor::new(object_data);
         let init_offset = 20;
+        // Low-memory callback mode (`emit_skipped_base_callback`) with an idx name for a leaf
+        // delta nobody depends on: the payload is still fully decoded and the idx name is kept
+        // only as a claim to verify after the delta is rebuilt (never emitted unverified).
+        let mut reader = Cursor::new(object_data.clone());
         let mut offset = init_offset;
-        let skipped = Pack::decode_pack_object_with_crc(
+        let delta = Pack::decode_pack_object_with_crc(
+            get_hash_kind(),
             &mut reader,
             &mut offset,
-            false,
+            true,
             true,
             true,
             Some(supplied_hash),
+            None,
             Some(&retention),
         )
         .unwrap()
         .unwrap();
 
-        assert_eq!(skipped.crc32, 0);
-        assert!(skipped.data_decompressed.is_empty());
-        assert_eq!(skipped.known_hash, Some(supplied_hash));
+        assert_eq!(delta.data_decompressed, b"abc");
+        let expected_crc = crc32fast::hash(&object_data);
+        assert_eq!(delta.crc32, expected_crc);
+        assert_eq!(delta.known_hash, Some(supplied_hash));
+        assert!(delta.is_delta_in_pack);
+
+        // An idx CRC that does not match the compressed bytes is rejected inside the object
+        // decoder (so it holds for skipped, base and delta objects alike); the right CRC passes.
+        for (known_crc, ok) in [(Some(expected_crc ^ 1), false), (Some(expected_crc), true)] {
+            let mut reader = Cursor::new(object_data.clone());
+            let mut offset = init_offset;
+            let result = Pack::decode_pack_object_with_crc(
+                get_hash_kind(),
+                &mut reader,
+                &mut offset,
+                true,
+                true,
+                true,
+                Some(supplied_hash),
+                known_crc,
+                Some(&retention),
+            );
+            match result {
+                Ok(Some(_)) => assert!(ok),
+                Err(err) => assert!(!ok && err.to_string().contains("CRC32"), "{err}"),
+                Ok(None) => panic!("delta payload must never be skipped"),
+            }
+        }
         assert_eq!(
-            skipped.info,
-            CacheObjectInfo::OffsetDelta(init_offset - 5, 0)
+            delta.info,
+            CacheObjectInfo::OffsetDelta(init_offset - 5, 0x62)
         );
-        assert_eq!(offset, init_offset + reader.get_ref().len());
+        assert_eq!(offset, init_offset + object_data.len());
+
+        // Same for the plain no-callback path (no base-callback emission).
+        let mut reader = Cursor::new(object_data.clone());
+        let mut offset = init_offset;
+        let delta = Pack::decode_pack_object_with_crc(
+            get_hash_kind(),
+            &mut reader,
+            &mut offset,
+            false,
+            true,
+            false,
+            Some(supplied_hash),
+            None,
+            Some(&retention),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(delta.data_decompressed, b"abc");
+        assert_eq!(delta.known_hash, Some(supplied_hash));
+        assert_eq!(offset, init_offset + object_data.len());
     }
 
+    /// A thin or malformed pack whose delta base never appears — a ref-delta base outside the
+    /// pack, or an offset-delta pointing at a non-object offset — is a `GitError`, never a panic.
     #[test]
-    fn test_low_memory_delta_callback_entry_uses_known_hash_without_payload() {
-        let hash = ObjectHash::new(b"known-leaf-delta-hash");
-        let delta_obj = CacheObject {
-            info: CacheObjectInfo::OffsetDelta(12, 5),
-            offset: 40,
-            crc32: 1234,
-            data_decompressed: b"delta instructions".to_vec(),
-            mem_recorder: None,
-            is_delta_in_pack: true,
-            known_hash: Some(hash),
-        };
+    fn test_missing_delta_base_fails_closed() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let kind = HashKind::Sha1;
+        let missing_base = ObjectHash::new_for_kind(kind, b"base object not in this pack");
+        let delta_payload = [b"\x05\x05\x05".as_ref(), b"HELLO"].concat();
 
-        let entry = Pack::low_memory_delta_callback_entry(&delta_obj, ObjectType::Blob, hash);
+        // 1) ref-delta whose base is not in the pack.
+        let mut thin = Vec::new();
+        thin.extend_from_slice(b"PACK");
+        thin.extend_from_slice(&2u32.to_be_bytes());
+        thin.extend_from_slice(&2u32.to_be_bytes());
+        thin.push(0x35);
+        append_compressed(&mut thin, b"hello");
+        thin.push(0x78);
+        thin.extend_from_slice(missing_base.as_ref());
+        append_compressed(&mut thin, &delta_payload);
+        let trailer = ObjectHash::new_for_kind(kind, &thin);
+        thin.extend_from_slice(trailer.as_ref());
 
-        assert_eq!(entry.inner.obj_type, ObjectType::Blob);
-        assert!(entry.inner.data.is_empty());
-        assert_eq!(entry.inner.hash, hash);
-        assert_eq!(entry.meta.pack_offset, Some(40));
-        assert_eq!(entry.meta.crc32, Some(1234));
-        assert_eq!(entry.meta.is_delta, Some(true));
+        // 2) offset-delta whose base offset points one byte past the blob's object start.
+        let mut skewed = Vec::new();
+        skewed.extend_from_slice(b"PACK");
+        skewed.extend_from_slice(&2u32.to_be_bytes());
+        skewed.extend_from_slice(&2u32.to_be_bytes());
+        let blob_offset = skewed.len() as u8;
+        skewed.push(0x35);
+        append_compressed(&mut skewed, b"hello");
+        let delta_offset = skewed.len() as u8;
+        skewed.push(0x68);
+        skewed.push(delta_offset - (blob_offset + 1));
+        append_compressed(&mut skewed, &delta_payload);
+        let trailer = ObjectHash::new_for_kind(kind, &skewed);
+        skewed.extend_from_slice(trailer.as_ref());
+
+        for (name, pack_data) in [("ref", thin), ("offset", skewed)] {
+            for with_callback in [false, true] {
+                let (_tmp_dir, tmp) = pack_test_tmp();
+                let mut pack = Pack::new_with_hash_kind(kind, Some(1), None, Some(tmp), true);
+                let result = if with_callback {
+                    pack.decode(&mut Cursor::new(&pack_data), |_| {}, None::<fn(ObjectHash)>)
+                } else {
+                    let (dir, _) = pack_test_tmp();
+                    let path = dir.path().join(format!("{name}.pack"));
+                    fs::write(&path, &pack_data).unwrap();
+                    pack.decode_file_without_callback(&path, None::<fn(ObjectHash)>)
+                };
+                let err = result.expect_err("missing delta base must be an error");
+                assert!(
+                    err.to_string().contains("not in the pack"),
+                    "{name} delta (callback={with_callback}): {err}"
+                );
+            }
+        }
+    }
+
+    /// An idx whose entry does not point at its object's real start offset — or that lists one
+    /// offset twice — is rejected by every file decoder even when names, CRCs and checksums
+    /// verify: offsets are checked per object, never as a set.
+    #[test]
+    fn test_pack_decode_file_rejects_idx_offset_mismatch() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let kind = HashKind::Sha1;
+        let hash_a =
+            utils::calculate_object_hash_for_kind(kind, ObjectType::Blob, b"hello").unwrap();
+        let hash_b =
+            utils::calculate_object_hash_for_kind(kind, ObjectType::Blob, b"world").unwrap();
+        let mut pack_data = Vec::new();
+        pack_data.extend_from_slice(b"PACK");
+        pack_data.extend_from_slice(&2u32.to_be_bytes());
+        pack_data.extend_from_slice(&2u32.to_be_bytes());
+        let offset_a = pack_data.len();
+        pack_data.push(0x35);
+        append_compressed(&mut pack_data, b"hello");
+        let offset_b = pack_data.len();
+        pack_data.push(0x35);
+        append_compressed(&mut pack_data, b"world");
+        let trailer = ObjectHash::new_for_kind(kind, &pack_data);
+        pack_data.extend_from_slice(trailer.as_ref());
+        let payload_end = pack_data.len() - kind.size();
+        let crc_a = crc32fast::hash(&pack_data[offset_a..offset_b]);
+        let crc_b = crc32fast::hash(&pack_data[offset_b..payload_end]);
+
+        let dir = tempdir().unwrap();
+        let pack_path = dir.path().join("offsets.pack");
+        fs::write(&pack_path, &pack_data).unwrap();
+        // Names and CRCs are right, but the second entry claims offset 13 (inside the first
+        // object; the byte there parses as a plausible object header, so the dependency scan
+        // alone does not notice).
+        write_test_idx_entries_for_kind(
+            &pack_path,
+            vec![(hash_a, offset_a as u32, crc_a), (hash_b, 13, crc_b)],
+            kind,
+        );
+        for (i, with_callback) in [false, true].into_iter().enumerate() {
+            let mut pack = Pack::new_with_hash_kind(
+                kind,
+                Some(1),
+                None,
+                Some(dir.path().join(format!("tmp{i}"))),
+                true,
+            );
+            let err = if with_callback {
+                pack.decode_file(&pack_path, |_| {}, None::<fn(ObjectHash)>)
+            } else {
+                pack.decode_file_without_callback(&pack_path, None::<fn(ObjectHash)>)
+            }
+            .unwrap_err();
+            assert!(
+                err.to_string().contains(&format!(
+                    "starts at offset {offset_b} but the pack index records offset 13"
+                )),
+                "{err}"
+            );
+        }
+        // The correct idx is accepted.
+        write_test_idx_for_kind(
+            &pack_path,
+            vec![(hash_a, offset_a as u32), (hash_b, offset_b as u32)],
+            kind,
+        );
+        let mut pack =
+            Pack::new_with_hash_kind(kind, Some(1), None, Some(dir.path().join("tmp-ok")), true);
+        pack.decode_file_without_callback(&pack_path, None::<fn(ObjectHash)>)
+            .unwrap();
+        assert_eq!(pack.number, 2);
+        // One offset listed twice is rejected by the shared idx reader.
+        write_test_idx_entries_for_kind(
+            &pack_path,
+            vec![
+                (hash_a, offset_a as u32, crc_a),
+                (hash_b, offset_a as u32, crc_b),
+            ],
+            kind,
+        );
+        let mut pack =
+            Pack::new_with_hash_kind(kind, Some(1), None, Some(dir.path().join("tmp-dup")), true);
+        let err = pack
+            .decode_file_without_callback(&pack_path, None::<fn(ObjectHash)>)
+            .unwrap_err();
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    /// A `.idx` path that exists but cannot be opened (dangling symlink) is an error for the
+    /// file decoders, never a silent fallback to the no-idx scan path.
+    #[cfg(unix)]
+    #[test]
+    fn test_pack_decode_file_dangling_idx_symlink_fails_closed() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let (pack_data, _) = single_blob_pack_for_kind(HashKind::Sha1, b"dangling idx");
+        let dir = tempdir().unwrap();
+        let pack_path = dir.path().join("dangling.pack");
+        fs::write(&pack_path, &pack_data).unwrap();
+        let idx_path = pack_path.with_extension("idx");
+        std::os::unix::fs::symlink(dir.path().join("missing.idx"), &idx_path).unwrap();
+
+        let mut pack = Pack::new_with_hash_kind(
+            HashKind::Sha1,
+            Some(1),
+            None,
+            Some(dir.path().join("tmp1")),
+            true,
+        );
+        let err = pack
+            .decode_file(&pack_path, |_| {}, None::<fn(ObjectHash)>)
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+        let mut pack = Pack::new_with_hash_kind(
+            HashKind::Sha1,
+            Some(1),
+            None,
+            Some(dir.path().join("tmp2")),
+            true,
+        );
+        let err = pack
+            .decode_file_without_callback(&pack_path, None::<fn(ObjectHash)>)
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+
+        // Removing the dangling link restores the (idx-less) scan path.
+        fs::remove_file(&idx_path).unwrap();
+        let mut pack = Pack::new_with_hash_kind(
+            HashKind::Sha1,
+            Some(1),
+            None,
+            Some(dir.path().join("tmp3")),
+            true,
+        );
+        pack.decode_file(&pack_path, |_| {}, None::<fn(ObjectHash)>)
+            .unwrap();
     }
 
     #[test]
@@ -2934,7 +3091,10 @@ mod tests {
             idx_data.extend_from_slice(&count.to_be_bytes());
         }
         idx_data.extend_from_slice(obj_hash.as_ref());
-        idx_data.extend_from_slice(&0u32.to_be_bytes());
+        // Real CRC32 of the object's compressed pack bytes (idx CRCs are verified).
+        idx_data.extend_from_slice(
+            &crc32fast::hash(&pack_data[12..pack_data.len() - 20]).to_be_bytes(),
+        );
         idx_data.extend_from_slice(&12u32.to_be_bytes());
         append_test_idx_trailer(&mut idx_data, &trailer);
         fs::write(pack_path.with_extension("idx"), idx_data).unwrap();
@@ -3007,7 +3167,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_decode_file_callback_ignores_idx_with_bad_checksum() {
+    fn test_pack_decode_file_callback_rejects_idx_with_bad_checksum() {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(b"a").unwrap();
@@ -3037,22 +3197,38 @@ mod tests {
         }
         let hash_offset = idx_data.len();
         idx_data.extend_from_slice(obj_hash.as_ref());
-        idx_data.extend_from_slice(&0u32.to_be_bytes());
+        // Real CRC32 of the object's compressed pack bytes (idx CRCs are verified).
+        idx_data.extend_from_slice(
+            &crc32fast::hash(&pack_data[12..pack_data.len() - 20]).to_be_bytes(),
+        );
         idx_data.extend_from_slice(&12u32.to_be_bytes());
         append_test_idx_trailer(&mut idx_data, &trailer);
         idx_data[hash_offset] ^= 0xff;
         fs::write(pack_path.with_extension("idx"), idx_data).unwrap();
 
+        // A corrupt idx next to the pack is an error (fail-closed), not a silent full rescan.
+        let mut pack = Pack::new(Some(1), None, Some(dir.path().join("tmp")), true);
+        let err = pack
+            .decode_file(&pack_path, |_| {}, None::<fn(ObjectHash)>)
+            .unwrap_err();
+        // Either the corrupted name trips the fanout/name validation or the checksum check.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Pack index") || msg.contains("checksum"),
+            "{msg}"
+        );
+
+        // Removing the corrupt idx restores the scan path and yields the object.
+        fs::remove_file(pack_path.with_extension("idx")).unwrap();
         let entries = Arc::new(std::sync::Mutex::new(Vec::new()));
         let entries_for_cb = Arc::clone(&entries);
-        let mut pack = Pack::new(Some(1), None, Some(dir.path().join("tmp")), true);
+        let mut pack = Pack::new(Some(1), None, Some(dir.path().join("tmp2")), true);
         pack.decode_file(
             &pack_path,
             move |entry| entries_for_cb.lock().unwrap().push(entry.inner.hash),
             None::<fn(ObjectHash)>,
         )
         .unwrap();
-
         assert_eq!(entries.lock().unwrap().as_slice(), &[obj_hash]);
     }
 
@@ -3086,7 +3262,10 @@ mod tests {
             idx_data.extend_from_slice(&count.to_be_bytes());
         }
         idx_data.extend_from_slice(obj_hash.as_ref());
-        idx_data.extend_from_slice(&0u32.to_be_bytes());
+        // Real CRC32 of the object's compressed pack bytes (idx CRCs are verified).
+        idx_data.extend_from_slice(
+            &crc32fast::hash(&pack_data[12..pack_data.len() - 20]).to_be_bytes(),
+        );
         idx_data.extend_from_slice(&12u32.to_be_bytes());
         append_test_idx_trailer(&mut idx_data, &trailer);
         fs::write(pack_path.with_extension("idx"), idx_data).unwrap();
@@ -3129,7 +3308,10 @@ mod tests {
             idx_data.extend_from_slice(&count.to_be_bytes());
         }
         idx_data.extend_from_slice(obj_hash.as_ref());
-        idx_data.extend_from_slice(&0u32.to_be_bytes());
+        // Real CRC32 of the object's compressed pack bytes (idx CRCs are verified).
+        idx_data.extend_from_slice(
+            &crc32fast::hash(&pack_data[12..pack_data.len() - 20]).to_be_bytes(),
+        );
         idx_data.extend_from_slice(&0x8000_0000u32.to_be_bytes());
         idx_data.extend_from_slice(&12u64.to_be_bytes());
         append_test_idx_trailer(&mut idx_data, &trailer);
@@ -3201,7 +3383,10 @@ mod tests {
             idx_data.extend_from_slice(&count.to_be_bytes());
         }
         idx_data.extend_from_slice(obj_hash.as_ref());
-        idx_data.extend_from_slice(&0u32.to_be_bytes());
+        // Real CRC32 of the object's compressed pack bytes (idx CRCs are verified).
+        idx_data.extend_from_slice(
+            &crc32fast::hash(&pack_data[12..pack_data.len() - 20]).to_be_bytes(),
+        );
         idx_data.extend_from_slice(&12u32.to_be_bytes());
         append_test_idx_trailer(&mut idx_data, &[0xff; 20]);
         fs::write(pack_path.with_extension("idx"), idx_data).unwrap();
@@ -3257,7 +3442,10 @@ mod tests {
             idx_data.extend_from_slice(&count.to_be_bytes());
         }
         idx_data.extend_from_slice(obj_hash.as_ref());
-        idx_data.extend_from_slice(&0u32.to_be_bytes());
+        // Real CRC32 of the object's compressed pack bytes (idx CRCs are verified).
+        idx_data.extend_from_slice(
+            &crc32fast::hash(&changed_pack_data[12..changed_pack_data.len() - 20]).to_be_bytes(),
+        );
         idx_data.extend_from_slice(&12u32.to_be_bytes());
         append_test_idx_trailer(&mut idx_data, &original_trailer);
         fs::write(pack_path.with_extension("idx"), idx_data).unwrap();
@@ -3267,7 +3455,13 @@ mod tests {
             .decode_file_full_without_callback(&pack_path, None::<fn(ObjectHash)>)
             .unwrap_err();
 
-        assert!(err.to_string().contains("does not match the trailer hash"));
+        // The stale idx is rejected fail-closed: either its object names no longer match the
+        // changed pack content, or its recorded pack hash disagrees with the trailer.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pack index names it") || msg.contains("does not match the trailer hash"),
+            "{msg}"
+        );
     }
 
     fn append_compressed(buf: &mut Vec<u8>, data: &[u8]) {
@@ -3290,37 +3484,471 @@ mod tests {
     }
 
     fn append_test_idx_trailer(idx_data: &mut Vec<u8>, pack_hash: &[u8]) {
+        append_test_idx_trailer_for_kind(idx_data, pack_hash, get_hash_kind());
+    }
+
+    fn append_test_idx_trailer_for_kind(idx_data: &mut Vec<u8>, pack_hash: &[u8], kind: HashKind) {
         idx_data.extend_from_slice(pack_hash);
-        let mut idx_hash = crate::utils::HashAlgorithm::new();
+        let mut idx_hash = crate::utils::HashAlgorithm::new_for_kind(kind);
         idx_hash.update(idx_data);
         idx_data.extend_from_slice(&idx_hash.finalize());
     }
 
-    fn write_test_idx(pack_path: &Path, mut objects: Vec<(ObjectHash, u32)>) {
+    /// Build a single-blob pack whose object ID and trailer use an explicit `kind`.
+    fn single_blob_pack_for_kind(kind: HashKind, data: &[u8]) -> (Vec<u8>, ObjectHash) {
+        let obj_hash = utils::calculate_object_hash_for_kind(kind, ObjectType::Blob, data).unwrap();
+        let mut pack_data = Vec::new();
+        pack_data.extend_from_slice(b"PACK");
+        pack_data.extend_from_slice(&2u32.to_be_bytes());
+        pack_data.extend_from_slice(&1u32.to_be_bytes());
+        pack_data.push(0x30 | data.len() as u8);
+        append_compressed(&mut pack_data, data);
+        let trailer = ObjectHash::new_for_kind(kind, &pack_data);
+        pack_data.extend_from_slice(trailer.as_ref());
+        (pack_data, obj_hash)
+    }
+
+    fn write_test_idx(pack_path: &Path, objects: Vec<(ObjectHash, u32)>) {
+        write_test_idx_for_kind(pack_path, objects, get_hash_kind());
+    }
+
+    fn write_test_idx_for_kind(pack_path: &Path, objects: Vec<(ObjectHash, u32)>, kind: HashKind) {
+        // Real CRC32 of each object's compressed pack bytes (object spans run to the next
+        // object's offset, or to the trailer for the last one).
+        let pack_data = fs::read(pack_path).unwrap();
+        let hash_size = kind.size();
+        let mut spans: Vec<u32> = objects.iter().map(|(_, off)| *off).collect();
+        spans.push((pack_data.len() - hash_size) as u32);
+        spans.sort_unstable();
+        let entries = objects
+            .into_iter()
+            .map(|(hash, offset)| {
+                let end = spans.iter().copied().find(|s| *s > offset).unwrap();
+                let crc = crc32fast::hash(&pack_data[offset as usize..end as usize]);
+                (hash, offset, crc)
+            })
+            .collect();
+        write_test_idx_entries_for_kind(pack_path, entries, kind);
+    }
+
+    /// Write an idx v2 with explicit `(name, offset, crc32)` entries (checksums sealed).
+    fn write_test_idx_entries_for_kind(
+        pack_path: &Path,
+        mut objects: Vec<(ObjectHash, u32, u32)>,
+        kind: HashKind,
+    ) {
         objects.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+        let pack_data = fs::read(pack_path).unwrap();
+        let hash_size = kind.size();
         let mut idx_data = Vec::new();
         idx_data.extend_from_slice(&0xff74_4f63u32.to_be_bytes());
         idx_data.extend_from_slice(&2u32.to_be_bytes());
         for fanout_idx in 0..256 {
             let count = objects
                 .iter()
-                .filter(|(hash, _)| hash.as_ref()[0] as usize <= fanout_idx)
+                .filter(|(hash, _, _)| hash.as_ref()[0] as usize <= fanout_idx)
                 .count() as u32;
             idx_data.extend_from_slice(&count.to_be_bytes());
         }
-        for (hash, _) in &objects {
+        for (hash, _, _) in &objects {
             idx_data.extend_from_slice(hash.as_ref());
         }
-        for _ in &objects {
-            idx_data.extend_from_slice(&0u32.to_be_bytes());
+        for (_, _, crc) in &objects {
+            idx_data.extend_from_slice(&crc.to_be_bytes());
         }
-        for (_, offset) in &objects {
+        for (_, offset, _) in &objects {
             idx_data.extend_from_slice(&offset.to_be_bytes());
         }
-        let pack_data = fs::read(pack_path).unwrap();
-        let hash_size = get_hash_kind().size();
-        append_test_idx_trailer(&mut idx_data, &pack_data[pack_data.len() - hash_size..]);
+        append_test_idx_trailer_for_kind(
+            &mut idx_data,
+            &pack_data[pack_data.len() - hash_size..],
+            kind,
+        );
         fs::write(pack_path.with_extension("idx"), idx_data).unwrap();
+    }
+
+    /// Non-seekable, read-once byte source that counts every byte handed out.
+    struct CountingOnce<'a> {
+        data: &'a [u8],
+        pos: usize,
+        counter: Arc<AtomicUsize>,
+    }
+    impl Read for CountingOnce<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            self.counter.fetch_add(n, Ordering::SeqCst);
+            Ok(n)
+        }
+    }
+
+    /// Hand-built BLAKE3 pack: base blob, offset delta and ref delta (32-byte BLAKE3 base ID),
+    /// with a BLAKE3 trailer. Returns the bytes and the three expected object IDs.
+    fn blake3_ref_delta_pack() -> (Vec<u8>, [ObjectHash; 3], [u32; 3]) {
+        let kind = HashKind::Blake3;
+        let base_hash =
+            utils::calculate_object_hash_for_kind(kind, ObjectType::Blob, b"hello").unwrap();
+        let ofs_hash =
+            utils::calculate_object_hash_for_kind(kind, ObjectType::Blob, b"hi there").unwrap();
+        let ref_hash =
+            utils::calculate_object_hash_for_kind(kind, ObjectType::Blob, b"HELLO").unwrap();
+        assert!(
+            [base_hash, ofs_hash, ref_hash]
+                .iter()
+                .all(|h| h.kind() == kind)
+        );
+
+        let mut pack_data = Vec::new();
+        pack_data.extend_from_slice(b"PACK");
+        pack_data.extend_from_slice(&2u32.to_be_bytes());
+        pack_data.extend_from_slice(&3u32.to_be_bytes());
+
+        let base_offset = pack_data.len() as u32;
+        pack_data.push(0x35);
+        append_compressed(&mut pack_data, b"hello");
+
+        let ofs_offset = pack_data.len() as u32;
+        pack_data.push(0x6b);
+        pack_data.push((ofs_offset - base_offset) as u8);
+        append_compressed(
+            &mut pack_data,
+            [b"\x05\x08\x08".as_ref(), b"hi there"].concat().as_slice(),
+        );
+
+        let ref_offset = pack_data.len() as u32;
+        pack_data.push(0x78);
+        pack_data.extend_from_slice(base_hash.as_ref()); // 32-byte BLAKE3 base ID
+        assert_eq!(base_hash.as_ref().len(), 32);
+        append_compressed(
+            &mut pack_data,
+            [b"\x05\x05\x05".as_ref(), b"HELLO"].concat().as_slice(),
+        );
+
+        let trailer = ObjectHash::new_for_kind(kind, &pack_data);
+        pack_data.extend_from_slice(trailer.as_ref());
+        (
+            pack_data,
+            [base_hash, ofs_hash, ref_hash],
+            [base_offset, ofs_offset, ref_offset],
+        )
+    }
+
+    /// A BLAKE3 pack without deltas decodes through an explicit-kind `Pack` while the
+    /// thread-local kind is SHA-1; the signature and object ID are `ObjectHash::Blake3`, and
+    /// a SHA-256 `Pack` rejects the same bytes.
+    #[test]
+    fn blake3_no_delta() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let (pack_data, obj_hash) = single_blob_pack_for_kind(HashKind::Blake3, b"blake3 blob");
+        assert_eq!(obj_hash.kind(), HashKind::Blake3);
+        let trailer =
+            ObjectHash::from_bytes_for_kind(HashKind::Blake3, &pack_data[pack_data.len() - 32..])
+                .unwrap();
+
+        let (_tmp_dir, tmp) = pack_test_tmp();
+        let mut pack = Pack::new_with_hash_kind(
+            HashKind::Blake3,
+            Some(1),
+            Some(1024 * 1024),
+            Some(tmp),
+            true,
+        );
+        assert_eq!(pack.hash_kind, HashKind::Blake3);
+        assert_eq!(pack.signature, ObjectHash::zero_for_kind(HashKind::Blake3));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        pack.decode(
+            &mut Cursor::new(&pack_data),
+            move |entry| sink.lock().unwrap().push(entry.inner.hash),
+            None::<fn(ObjectHash)>,
+        )
+        .unwrap();
+        assert_eq!(pack.number, 1);
+        assert_eq!(pack.signature, trailer);
+        assert_eq!(pack.signature.kind(), HashKind::Blake3);
+        assert_eq!(seen.lock().unwrap().as_slice(), &[obj_hash]);
+
+        // Legacy `Pack::new` follows the thread-local (SHA-1) kind and therefore fails.
+        let (_tmp_dir2, tmp2) = pack_test_tmp();
+        let mut legacy = Pack::new(Some(1), Some(1024 * 1024), Some(tmp2), true);
+        assert_eq!(legacy.hash_kind, HashKind::Sha1);
+        assert!(
+            legacy
+                .decode(&mut Cursor::new(&pack_data), |_| {}, None::<fn(ObjectHash)>)
+                .is_err()
+        );
+
+        // Partial file decode: a checksum-valid idx naming the (skipped) leaf blob wrongly is
+        // rejected; the correct idx is accepted.
+        let dir = tempdir().unwrap();
+        let pack_path = dir.path().join("blake3-leaf.pack");
+        fs::write(&pack_path, &pack_data).unwrap();
+        write_test_idx_for_kind(
+            &pack_path,
+            vec![(
+                ObjectHash::new_for_kind(HashKind::Blake3, b"wrong name"),
+                12,
+            )],
+            HashKind::Blake3,
+        );
+        let mut partial = Pack::new_with_hash_kind(
+            HashKind::Blake3,
+            Some(1),
+            None,
+            Some(dir.path().join("t1")),
+            true,
+        );
+        let err = partial
+            .decode_file_without_callback(&pack_path, None::<fn(ObjectHash)>)
+            .unwrap_err();
+        assert!(err.to_string().contains("pack index names it"), "{err}");
+        write_test_idx_for_kind(&pack_path, vec![(obj_hash, 12)], HashKind::Blake3);
+        let mut partial = Pack::new_with_hash_kind(
+            HashKind::Blake3,
+            Some(1),
+            None,
+            Some(dir.path().join("t2")),
+            true,
+        );
+        partial
+            .decode_file_without_callback(&pack_path, None::<fn(ObjectHash)>)
+            .unwrap();
+        assert_eq!(partial.signature, trailer);
+
+        // Same width, different algorithm: a SHA-256 pack must not accept a BLAKE3 trailer.
+        let (_tmp_dir3, tmp3) = pack_test_tmp();
+        let mut sha256 = Pack::new_with_hash_kind(
+            HashKind::Sha256,
+            Some(1),
+            Some(1024 * 1024),
+            Some(tmp3),
+            true,
+        );
+        let err = sha256
+            .decode(&mut Cursor::new(&pack_data), |_| {}, None::<fn(ObjectHash)>)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match the trailer hash"),
+            "{err}"
+        );
+    }
+
+    /// Ref-delta bases are read as 32-byte BLAKE3 IDs and resolved by BLAKE3 identity; both
+    /// the streaming decoder and the idx-backed file decoder agree on the three object IDs.
+    #[test]
+    fn blake3_ref_delta() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let (pack_data, [base_hash, ofs_hash, ref_hash], [base_offset, ofs_offset, ref_offset]) =
+            blake3_ref_delta_pack();
+        let trailer =
+            ObjectHash::from_bytes_for_kind(HashKind::Blake3, &pack_data[pack_data.len() - 32..])
+                .unwrap();
+
+        // Streaming decode with callbacks.
+        let (_tmp_dir, tmp) = pack_test_tmp();
+        let mut pack = Pack::new_with_hash_kind(HashKind::Blake3, Some(1), None, Some(tmp), true);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        pack.decode(
+            &mut Cursor::new(&pack_data),
+            move |entry| {
+                sink.lock()
+                    .unwrap()
+                    .push((entry.inner.hash, entry.inner.data.clone()))
+            },
+            None::<fn(ObjectHash)>,
+        )
+        .unwrap();
+        assert_eq!(pack.number, 3);
+        assert_eq!(pack.signature, trailer);
+        let seen = seen.lock().unwrap();
+        let by_hash: std::collections::HashMap<ObjectHash, Vec<u8>> =
+            seen.iter().cloned().collect();
+        assert_eq!(by_hash.len(), 3);
+        assert_eq!(by_hash[&base_hash], b"hello");
+        assert_eq!(by_hash[&ofs_hash], b"hi there");
+        assert_eq!(by_hash[&ref_hash], b"HELLO");
+        assert!(by_hash.keys().all(|h| h.kind() == HashKind::Blake3));
+
+        // File decode backed by a BLAKE3 idx v2.
+        let dir = tempdir().unwrap();
+        let pack_path = dir.path().join("blake3-delta.pack");
+        fs::write(&pack_path, &pack_data).unwrap();
+        write_test_idx_for_kind(
+            &pack_path,
+            vec![
+                (base_hash, base_offset),
+                (ofs_hash, ofs_offset),
+                (ref_hash, ref_offset),
+            ],
+            HashKind::Blake3,
+        );
+        let mut pack = Pack::new_with_hash_kind(
+            HashKind::Blake3,
+            Some(1),
+            None,
+            Some(dir.path().join("tmp")),
+            true,
+        );
+        pack.decode_file_without_callback(&pack_path, None::<fn(ObjectHash)>)
+            .unwrap();
+        assert_eq!(pack.number, 3);
+        assert_eq!(pack.signature, trailer);
+
+        // A checksum-valid idx whose object names are wrong is rejected (object/index mismatch).
+        let bogus = ObjectHash::new_for_kind(HashKind::Blake3, b"not the base");
+        write_test_idx_for_kind(
+            &pack_path,
+            vec![
+                (bogus, base_offset),
+                (ofs_hash, ofs_offset),
+                (ref_hash, ref_offset),
+            ],
+            HashKind::Blake3,
+        );
+        let mut pack = Pack::new_with_hash_kind(
+            HashKind::Blake3,
+            Some(1),
+            None,
+            Some(dir.path().join("tmp3")),
+            true,
+        );
+        let err = pack
+            .decode_file_without_callback(&pack_path, None::<fn(ObjectHash)>)
+            .unwrap_err();
+        assert!(err.to_string().contains("pack index names it"), "{err}");
+        // A checksum-valid idx naming the *leaf delta* wrongly is rejected too: deltas are always
+        // rebuilt (never skipped) so their names are verified.
+        let bogus_leaf = ObjectHash::new_for_kind(HashKind::Blake3, b"not the leaf");
+        write_test_idx_for_kind(
+            &pack_path,
+            vec![
+                (base_hash, base_offset),
+                (ofs_hash, ofs_offset),
+                (bogus_leaf, ref_offset),
+            ],
+            HashKind::Blake3,
+        );
+        let mut pack = Pack::new_with_hash_kind(
+            HashKind::Blake3,
+            Some(1),
+            None,
+            Some(dir.path().join("tmp5")),
+            true,
+        );
+        let err = pack
+            .decode_file_without_callback(&pack_path, None::<fn(ObjectHash)>)
+            .unwrap_err();
+        assert!(err.to_string().contains("pack index names it"), "{err}");
+        // An idx with correct names but a wrong CRC for one object is rejected by the
+        // CRC-tracking (callback) decode.
+        write_test_idx_for_kind(
+            &pack_path,
+            vec![
+                (base_hash, base_offset),
+                (ofs_hash, ofs_offset),
+                (ref_hash, ref_offset),
+            ],
+            HashKind::Blake3,
+        );
+        let idx_path = pack_path.with_extension("idx");
+        let mut idx_bytes = fs::read(&idx_path).unwrap();
+        let crc_start = 8 + 256 * 4 + 3 * 32;
+        idx_bytes[crc_start] ^= 0xff;
+        // re-seal the idx checksum so only the CRC is wrong
+        let hs = 32;
+        let body_len = idx_bytes.len() - hs;
+        let mut hasher = crate::utils::HashAlgorithm::new_for_kind(HashKind::Blake3);
+        hasher.update(&idx_bytes[..body_len]);
+        let reseal = hasher.finalize_object_hash();
+        idx_bytes[body_len..].copy_from_slice(reseal.as_ref());
+        fs::write(&idx_path, &idx_bytes).unwrap();
+        let mut pack = Pack::new_with_hash_kind(
+            HashKind::Blake3,
+            Some(1),
+            None,
+            Some(dir.path().join("tmp6")),
+            true,
+        );
+        let err = pack
+            .decode_file(&pack_path, |_| {}, None::<fn(ObjectHash)>)
+            .unwrap_err();
+        assert!(err.to_string().contains("CRC32"), "{err}");
+        // A SHA-256 idx (wrong kind, same width) for the BLAKE3 pack is rejected too.
+        write_test_idx_for_kind(
+            &pack_path,
+            vec![
+                (base_hash, base_offset),
+                (ofs_hash, ofs_offset),
+                (ref_hash, ref_offset),
+            ],
+            HashKind::Sha256,
+        );
+        let mut pack = Pack::new_with_hash_kind(
+            HashKind::Blake3,
+            Some(1),
+            None,
+            Some(dir.path().join("tmp4")),
+            true,
+        );
+        assert!(
+            pack.decode_file_without_callback(&pack_path, None::<fn(ObjectHash)>)
+                .is_err()
+        );
+
+        // A truncated pack (trailer cut short) fails closed instead of panicking.
+        let (_tmp_dir2, tmp2) = pack_test_tmp();
+        let mut truncated =
+            Pack::new_with_hash_kind(HashKind::Blake3, Some(1), None, Some(tmp2), true);
+        let cut = &pack_data[..pack_data.len() - 5];
+        assert!(
+            truncated
+                .decode(&mut Cursor::new(cut), |_| {}, None::<fn(ObjectHash)>)
+                .is_err()
+        );
+    }
+
+    /// Performance door: a BLAKE3 pack decodes from a non-seekable, read-once source in a
+    /// single pass (bytes read == pack length) with a tiny memory limit forcing the spill path.
+    #[test]
+    fn blake3_single_pass_stream() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let (pack_data, hashes, _) = blake3_ref_delta_pack();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let source = CountingOnce {
+            data: &pack_data,
+            pos: 0,
+            counter: counter.clone(),
+        };
+        let mut reader = BufReader::with_capacity(64, source);
+
+        let (_tmp_dir, tmp) = pack_test_tmp();
+        let mut pack =
+            Pack::new_with_hash_kind(HashKind::Blake3, Some(1), Some(4096), Some(tmp), true);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        pack.decode(
+            &mut reader,
+            move |entry| sink.lock().unwrap().push(entry.inner.hash),
+            None::<fn(ObjectHash)>,
+        )
+        .unwrap();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            pack_data.len(),
+            "pack must be read exactly once"
+        );
+        assert_eq!(pack.signature.kind(), HashKind::Blake3);
+        let seen: std::collections::HashSet<ObjectHash> =
+            seen.lock().unwrap().iter().copied().collect();
+        assert_eq!(
+            seen,
+            hashes
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<ObjectHash>>()
+        );
     }
 
     #[test]

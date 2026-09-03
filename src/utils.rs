@@ -141,8 +141,8 @@ impl HashAlgorithm {
     ///
     /// The kind is taken from the hasher itself, so this is correct on any
     /// thread and is the preferred replacement for
-    /// `ObjectHash::from_bytes(&hasher.finalize())` and
-    /// `ObjectHash::from_bytes_infer_kind(..)` patterns.
+    /// `ObjectHash::from_bytes(&hasher.finalize())` and for the deprecated
+    /// length-inferring `ObjectHash::from_bytes_infer_kind` helper.
     pub fn finalize_object_hash(self) -> ObjectHash {
         match self {
             HashAlgorithm::Sha1(hasher) => ObjectHash::Sha1(hasher.finalize().into()),
