@@ -11,7 +11,7 @@
 //! - A commit message that describes the changes made in the commit.
 //! - A reference to the parent commit or commits (in the case of a merge commit) that the new commit is based on.
 //! - The contents of the files in the repository at the time the commit was made.
-use std::{fmt::Display, str::FromStr};
+use std::fmt::Display;
 
 use bstr::ByteSlice;
 
@@ -207,59 +207,77 @@ impl Commit {
     }
 }
 
+/// Parse one `tree`/`parent` reference of a commit body as an ID of the
+/// commit's own repository `kind`. Fails closed with the full `HashError`
+/// diagnostic (operation, kind, expected/actual lengths); never infers the
+/// algorithm from the hex length.
+fn parse_commit_reference(kind: HashKind, field: &str, raw: &[u8]) -> Result<ObjectHash, GitError> {
+    let hex = std::str::from_utf8(raw).map_err(|_| {
+        GitError::InvalidHashValue(format!(
+            "commit {field} id is not UTF-8: expected {} {kind} hex chars, got {} bytes",
+            kind.hex_len(),
+            raw.len()
+        ))
+    })?;
+    ObjectHash::from_hex_for_kind(kind, hex)
+        .map_err(|e| GitError::InvalidHashValue(format!("commit {field} id: {e}")))
+}
+
 impl ObjectTrait for Commit {
+    /// Parse a commit body. `tree`/`parent` references are parsed as IDs of
+    /// `hash.kind()` — the repository kind of the commit being loaded — so a
+    /// 64-hex reference is never guessed to be SHA-256 by length alone and the
+    /// thread-local kind is not consulted. Structural errors fail closed with
+    /// [`GitError::InvalidCommitObject`]; reference errors carry the
+    /// [`crate::hash::HashError`] diagnostic in [`GitError::InvalidHashValue`].
     fn from_bytes(data: &[u8], hash: ObjectHash) -> Result<Self, GitError>
     where
         Self: Sized,
     {
-        let mut commit = data;
-        // Find the tree id and remove it from the data
-        let tree_end = commit.find_byte(0x0a).unwrap();
-        let tree_id: ObjectHash = ObjectHash::from_str(
-            String::from_utf8(commit[5..tree_end].to_owned()) // 5 is the length of "tree "
-                .unwrap()
-                .as_str(),
-        )
-        .unwrap();
-        let binding = commit[tree_end + 1..].to_vec(); // Move past the tree id
-        commit = &binding;
+        let kind = hash.kind();
 
-        // Find the parent commit ids and remove them from the data
-        let author_begin = commit.find("author").unwrap();
-        // Find all parent commit ids
-        // The parent commit ids are all the lines that start with "parent "
-        // We can use find_iter to find all occurrences of "parent "
-        // and then extract the SHA1/ SHA-256 hashes from them.
-        let parent_commit_ids: Vec<ObjectHash> = commit[..author_begin]
-            .find_iter("parent")
-            .map(|parent| {
-                let parent_end = commit[parent..].find_byte(0x0a).unwrap();
-                ObjectHash::from_str(
-                    // 7 is the length of "parent "
-                    String::from_utf8(commit[parent + 7..parent + parent_end].to_owned())
-                        .unwrap()
-                        .as_str(),
-                )
-                .unwrap()
-            })
-            .collect();
-        let binding = commit[author_begin..].to_vec();
-        commit = &binding;
+        // `tree <id>` line.
+        let tree_end = data.find_byte(0x0a).ok_or(GitError::InvalidCommitObject)?;
+        let tree_hex = data[..tree_end]
+            .strip_prefix(b"tree ")
+            .ok_or(GitError::InvalidCommitObject)?;
+        let tree_id = parse_commit_reference(kind, "tree", tree_hex)?;
+        let mut commit = &data[tree_end + 1..];
 
-        // Find the author and committer and remove them from the data
-        // 0x0a is the newline character
-        let author =
-            Signature::from_data(commit[..commit.find_byte(0x0a).unwrap()].to_vec()).unwrap();
+        // Zero or more `parent <id>` lines, then exactly the `author` line: any other
+        // header in between is a malformed body (no substring search for "author").
+        let mut parent_commit_ids: Vec<ObjectHash> = Vec::new();
+        loop {
+            let line_end = commit
+                .find_byte(0x0a)
+                .ok_or(GitError::InvalidCommitObject)?;
+            let line = &commit[..line_end];
+            if let Some(parent_hex) = line.strip_prefix(b"parent ") {
+                parent_commit_ids.push(parse_commit_reference(kind, "parent", parent_hex)?);
+                commit = &commit[line_end + 1..];
+            } else if line.starts_with(b"author ") {
+                break;
+            } else {
+                return Err(GitError::InvalidCommitObject);
+            }
+        }
 
-        let binding = commit[commit.find_byte(0x0a).unwrap() + 1..].to_vec();
-        commit = &binding;
-        let committer =
-            Signature::from_data(commit[..commit.find_byte(0x0a).unwrap()].to_vec()).unwrap();
+        // `author` and `committer` lines (0x0a is the newline character).
+        let author_end = commit
+            .find_byte(0x0a)
+            .ok_or(GitError::InvalidCommitObject)?;
+        let author = Signature::from_data(commit[..author_end].to_vec())?;
+        commit = &commit[author_end + 1..];
+        let committer_end = commit
+            .find_byte(0x0a)
+            .ok_or(GitError::InvalidCommitObject)?;
+        if !commit.starts_with(b"committer ") {
+            return Err(GitError::InvalidCommitObject);
+        }
+        let committer = Signature::from_data(commit[..committer_end].to_vec())?;
 
         // The rest is the message
-        let message = unsafe {
-            String::from_utf8_unchecked(commit[commit.find_byte(0x0a).unwrap() + 1..].to_vec())
-        };
+        let message = unsafe { String::from_utf8_unchecked(commit[committer_end + 1..].to_vec()) };
         Ok(Commit {
             id: hash,
             tree_id,

@@ -206,7 +206,9 @@ impl ObjectTrait for Note {
 
         Ok(Note {
             id: hash,
-            target_object_id: ObjectHash::default(), // Target association managed externally
+            // Target association is managed externally; the placeholder has the
+            // width of the note's own repository kind (never a fixed SHA-1 zero).
+            target_object_id: ObjectHash::zero_for_kind(hash.kind()),
             content,
         })
     }
@@ -242,19 +244,16 @@ mod tests {
     /// Helper to build a Note, serialize/deserialize with/without target under given hash kind.
     fn round_trip(kind: HashKind) {
         let _guard = set_hash_kind_for_test(kind);
-        let (target_id, hash_len) = match kind {
-            HashKind::Sha1 => (
-                ObjectHash::from_str("1234567890abcdef1234567890abcdef12345678").unwrap(),
-                40,
-            ),
-            HashKind::Sha256 => (
-                ObjectHash::from_str(
-                    "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                )
-                .unwrap(),
-                64,
-            ),
-        };
+        // `1234567890abcdef…` repeated to the width of `kind`; no exhaustive match on
+        // `HashKind`, so adding a variant does not break this helper.
+        let pattern: Vec<u8> = [0x12u8, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef]
+            .iter()
+            .cycle()
+            .take(kind.size())
+            .copied()
+            .collect();
+        let target_id = ObjectHash::from_bytes_for_kind(kind, &pattern).unwrap();
+        let hash_len = kind.hex_len();
         let content = "This commit needs review".to_string();
         let note = Note::new(target_id, content.clone());
 
@@ -268,11 +267,12 @@ mod tests {
         assert_eq!(data, content.as_bytes());
         assert_eq!(note.get_size(), content.len());
 
-        // basic deserialization (target remains default)
+        // basic deserialization (placeholder target has the note's own kind width)
         let basic = Note::from_bytes(&data, note.id).unwrap();
         assert_eq!(basic.content, content);
         assert_eq!(basic.id, note.id);
-        assert_eq!(basic.target_object_id, ObjectHash::default());
+        assert_eq!(basic.target_object_id, ObjectHash::zero_for_kind(kind));
+        assert_eq!(basic.target_object_id.kind(), kind);
 
         // with target
         let (data_with_target, returned_target) = note.to_data_with_target().unwrap();

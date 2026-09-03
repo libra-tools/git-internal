@@ -254,13 +254,13 @@ impl TreeItem {
 
     /// Convert a TreeItem to a byte vector
     /// ```rust
-    /// use std::str::FromStr;
     /// use git_internal::internal::object::tree::{TreeItem, TreeItemMode};
-    /// use git_internal::hash::ObjectHash;
+    /// use git_internal::hash::{HashKind, ObjectHash};
     ///
     /// let tree_item = TreeItem::new(
     ///     TreeItemMode::Blob,
-    ///     ObjectHash::from_str("8ab686eafeb1f44702738c8b0f24f2567c36da6d").unwrap(),
+    ///     ObjectHash::from_hex_for_kind(HashKind::Sha1, "8ab686eafeb1f44702738c8b0f24f2567c36da6d")
+    ///         .unwrap(),
     ///     "hello-world".to_string(),
     /// );
     ///
@@ -560,10 +560,22 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        // Correct width parses regardless of the thread-local kind.
+        // Correct width parses regardless of the thread-local kind (20 bytes as SHA-1 while the
+        // thread-local is SHA-256, and 32 bytes as SHA-256 while the thread-local is SHA-1).
         let item = TreeItem::from_bytes_with_kind(&short_id, HashKind::Sha1).unwrap();
         assert_eq!(item.id, ObjectHash::Sha1(id));
         assert_eq!(item.name, "name");
+        {
+            let _guard = set_hash_kind_for_test(HashKind::Sha1);
+            let wide_id = [0x22u8; 32];
+            let mut wide = b"100755 wide\0".to_vec();
+            wide.extend_from_slice(&wide_id);
+            let item = TreeItem::from_bytes_with_kind(&wide, HashKind::Sha256).unwrap();
+            assert_eq!(item.id, ObjectHash::Sha256(wide_id));
+            assert_eq!(item.mode, TreeItemMode::BlobExecutable);
+            assert_eq!(item.name, "wide");
+            assert!(TreeItem::from_bytes_with_kind(&wide, HashKind::Sha1).is_err());
+        }
     }
 
     #[test]

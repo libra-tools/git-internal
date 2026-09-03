@@ -36,7 +36,7 @@
 //!
 //! So, we can use the `git cat-file -p <tag>` command to get the tag object, and the command not
 //! for the lightweight tag.
-use std::{fmt::Display, str::FromStr};
+use std::fmt::Display;
 
 use bstr::ByteSlice;
 
@@ -170,11 +170,20 @@ impl ObjectTrait for Tag {
         for line in headers.lines() {
             if let Some(s) = line.strip_prefix(b"object ") {
                 let hash_str = s.to_str().map_err(|_| {
-                    GitError::InvalidTagObject("Invalid UTF-8 in object hash".to_string())
+                    GitError::InvalidTagObject(format!(
+                        "Invalid UTF-8 in object hash (from_bytes: expected {} {} hex chars, got {} bytes)",
+                        hash.kind().hex_len(),
+                        hash.kind(),
+                        s.len()
+                    ))
                 })?;
-                object_hash = Some(ObjectHash::from_str(hash_str).map_err(|_| {
-                    GitError::InvalidTagObject("Invalid object hash format".to_string())
-                })?);
+                // The referenced object belongs to the tag's own repository kind; never
+                // infer the algorithm from the hex length.
+                object_hash = Some(
+                    ObjectHash::from_hex_for_kind(hash.kind(), hash_str).map_err(|e| {
+                        GitError::InvalidTagObject(format!("Invalid object hash format: {e}"))
+                    })?,
+                );
             } else if let Some(s) = line.strip_prefix(b"type ") {
                 let type_str = s.to_str().map_err(|_| {
                     GitError::InvalidTagObject("Invalid UTF-8 in object type".to_string())
@@ -253,6 +262,8 @@ impl ObjectTrait for Tag {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
     use crate::{
         hash::{HashKind, ObjectHash, set_hash_kind_for_test},
@@ -268,18 +279,22 @@ mod tests {
         )
     }
 
+    /// `1234567890abcdef…` repeated to the width of `kind` (no exhaustive `HashKind` match,
+    /// so adding a variant does not break this helper).
+    fn pattern_id(kind: HashKind) -> ObjectHash {
+        let bytes: Vec<u8> = [0x12u8, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef]
+            .iter()
+            .cycle()
+            .take(kind.size())
+            .copied()
+            .collect();
+        ObjectHash::from_bytes_for_kind(kind, &bytes).unwrap()
+    }
+
     /// Tag creation should serialize/deserialize correctly under the given hash kind.
     fn round_trip(kind: HashKind) {
         let _guard = set_hash_kind_for_test(kind);
-        let target = match kind {
-            HashKind::Sha1 => {
-                ObjectHash::from_str("1234567890abcdef1234567890abcdef12345678").unwrap()
-            }
-            HashKind::Sha256 => ObjectHash::from_str(
-                "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-            )
-            .unwrap(),
-        };
+        let target = pattern_id(kind);
         let sig = make_sig();
         let tag = Tag::new(
             target,
@@ -318,15 +333,7 @@ mod tests {
     fn tag_id_is_canonical_hash_of_to_data() {
         for kind in [HashKind::Sha1, HashKind::Sha256] {
             let _guard = set_hash_kind_for_test(kind);
-            let target = match kind {
-                HashKind::Sha1 => {
-                    ObjectHash::from_str("1234567890abcdef1234567890abcdef12345678").unwrap()
-                }
-                HashKind::Sha256 => ObjectHash::from_str(
-                    "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                )
-                .unwrap(),
-            };
+            let target = pattern_id(kind);
             let tag = Tag::new(
                 target,
                 ObjectType::Commit,

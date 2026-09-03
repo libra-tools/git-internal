@@ -115,53 +115,89 @@ impl Display for Signature {
     }
 }
 
+/// Format a UTC offset in seconds as Git's canonical `[+-]HHMM` timezone.
+///
+/// The sign is applied once to the whole offset, so negative half-hour zones
+/// render as `-0230` (never `-02-30`), matching what
+/// [`Signature::from_data`] accepts.
+pub fn format_timezone(offset_seconds: i32) -> String {
+    let sign = if offset_seconds < 0 { '-' } else { '+' };
+    let total_minutes = offset_seconds.unsigned_abs() / 60;
+    format!("{sign}{:02}{:02}", total_minutes / 60, total_minutes % 60)
+}
+
 impl Signature {
     /// The `from_data` method is used to convert a `Vec<u8>` to a `Signature` struct.
+    ///
+    /// Parses `<role> <name> <<email>> <timestamp> <tz>`. Every structural
+    /// problem (missing role/`<`/`>`/space separators, non-UTF-8 text, a
+    /// non-numeric timestamp, a timezone that is not `[+-]HHMM`) fails closed
+    /// with [`GitError::InvalidSignatureType`] instead of panicking, so callers
+    /// such as `Commit::from_bytes` can reject a malformed object body. An
+    /// empty name (`author <mail> 1 +0000`) is accepted, as in Git.
     pub fn from_data(data: Vec<u8>) -> Result<Signature, GitError> {
-        // Make a mutable copy of the input data vector.
-        let mut sign = data;
-
-        // Find the index of the first space byte in the data vector.
-        let name_start = sign.find_byte(0x20).unwrap();
-
-        // Parse the author name from the bytes up to the first space byte.
-        // If the parsing fails, unwrap will panic.
-        let signature_type = SignatureType::from_data(sign[..name_start].to_vec())?;
-
-        let (name, email) = {
-            let email_start = sign.find_byte(0x3C).unwrap();
-            let email_end = sign.find_byte(0x3E).unwrap();
-
-            unsafe {
-                (
-                    sign[name_start + 1..email_start - 1]
-                        .to_str_unchecked()
-                        .to_string(),
-                    sign[email_start + 1..email_end]
-                        .to_str_unchecked()
-                        .to_string(),
-                )
-            }
+        let sign = data;
+        let malformed = |what: &str| {
+            GitError::InvalidSignatureType(format!(
+                "malformed signature line ({what}): {:?}",
+                String::from_utf8_lossy(&sign)
+            ))
+        };
+        let utf8 = |bytes: &[u8], what: &str| -> Result<String, GitError> {
+            std::str::from_utf8(bytes)
+                .map(str::to_string)
+                .map_err(|_| malformed(what))
         };
 
-        // Update the data vector to remove the author and email bytes.
-        sign = sign[sign.find_byte(0x3E).unwrap() + 2..].to_vec();
+        // `<role>` up to the first space.
+        let name_start = sign
+            .find_byte(0x20)
+            .ok_or_else(|| malformed("missing role separator"))?;
+        let role = utf8(&sign[..name_start], "role")?;
+        let signature_type = SignatureType::from_str(&role)?;
 
-        // Find the index of the second space byte in the updated data vector.
-        let timestamp_split = sign.find_byte(0x20).unwrap();
-
-        // Parse the timestamp integer from the bytes up to the second space byte.
-        // If the parsing fails, unwrap will panic.
-        let timestamp = unsafe {
-            sign[0..timestamp_split]
-                .to_str_unchecked()
-                .parse::<usize>()
-                .unwrap()
+        // `<name> <<email>>`: `<` must follow the role separator; the name is the text
+        // between them minus its single trailing space (it may be empty).
+        let email_start = sign
+            .find_byte(0x3C)
+            .filter(|&i| i > name_start)
+            .ok_or_else(|| malformed("missing '<' before email"))?;
+        let email_end = sign
+            .find_byte(0x3E)
+            .filter(|&i| i > email_start)
+            .ok_or_else(|| malformed("missing '>' after email"))?;
+        // A non-empty name must be followed by exactly one space before `<`.
+        let name_bytes = &sign[name_start + 1..email_start];
+        let name_bytes = match name_bytes.strip_suffix(b" ") {
+            Some(stripped) => stripped,
+            None if name_bytes.is_empty() => name_bytes,
+            None => return Err(malformed("missing space before '<'")),
         };
+        let name = utf8(name_bytes, "name")?;
+        let email = utf8(&sign[email_start + 1..email_end], "email")?;
 
-        // Parse the timezone string from the bytes after the second space byte.
-        // If the parsing fails, unwrap will panic.
-        let timezone = unsafe { sign[timestamp_split + 1..].to_str_unchecked().to_string() };
+        // `> <timestamp> <tz>`: exactly one space after `>`, a decimal timestamp and a
+        // non-empty timezone.
+        if sign.get(email_end + 1) != Some(&0x20) {
+            return Err(malformed("missing space after email"));
+        }
+        let rest = &sign[email_end + 2..];
+        let timestamp_split = rest
+            .find_byte(0x20)
+            .ok_or_else(|| malformed("missing timezone separator"))?;
+        let timestamp = utf8(&rest[..timestamp_split], "timestamp")?
+            .parse::<usize>()
+            .map_err(|_| malformed("non-numeric timestamp"))?;
+        // Timezone must be Git's canonical `[+-]HHMM` (what `git fsck` calls a
+        // well-formed timezone); anything else is rejected.
+        let timezone = utf8(&rest[timestamp_split + 1..], "timezone")?;
+        let tz = timezone.as_bytes();
+        let tz_ok = tz.len() == 5
+            && (tz[0] == b'+' || tz[0] == b'-')
+            && tz[1..].iter().all(u8::is_ascii_digit);
+        if !tz_ok {
+            return Err(malformed("timezone is not [+-]HHMM"));
+        }
 
         // Return a Result object indicating success
         Ok(Signature {
@@ -209,14 +245,8 @@ impl Signature {
         // Get the offset from UTC in minutes (local time - UTC time)
         let offset = local_time.offset().fix().local_minus_utc();
 
-        // Calculate the hours part of the offset (divide by 3600 to convert from seconds to hours)
-        let hours = offset / 60 / 60;
-
-        // Calculate the minutes part of the offset (remaining minutes after dividing by 60)
-        let minutes = offset / 60 % 60;
-
-        // Format the offset as a string (e.g., "+0800", "-0300", etc.)
-        let offset_str = format!("{hours:+03}{minutes:02}");
+        // Format the offset as Git's canonical `[+-]HHMM` (e.g., "+0800", "-0230").
+        let offset_str = format_timezone(offset);
 
         // Return the Signature struct with the provided information
         Signature {
@@ -331,5 +361,40 @@ mod tests {
 
         let naive_datetime = DateTime::from_timestamp(sign.timestamp as i64, 0).unwrap();
         println!("Formatted DateTime: {}", naive_datetime.naive_local());
+    }
+
+    /// `format_timezone` always yields canonical `[+-]HHMM`, including negative half-hour zones.
+    #[test]
+    fn signature_format_timezone_is_canonical() {
+        use crate::internal::object::signature::format_timezone;
+        assert_eq!(format_timezone(0), "+0000");
+        assert_eq!(format_timezone(8 * 3600), "+0800");
+        assert_eq!(format_timezone(5 * 3600 + 30 * 60), "+0530");
+        assert_eq!(format_timezone(-(2 * 3600 + 30 * 60)), "-0230");
+        assert_eq!(format_timezone(-3600), "-0100");
+        assert_eq!(format_timezone(-(9 * 3600 + 30 * 60)), "-0930");
+        assert_eq!(format_timezone(12 * 3600 + 45 * 60), "+1245");
+    }
+
+    /// `Signature::new` output must always be accepted by the strict `from_data` parser.
+    #[test]
+    fn signature_new_round_trips_through_from_data() {
+        for role in [
+            SignatureType::Author,
+            SignatureType::Committer,
+            SignatureType::Tagger,
+        ] {
+            let sig = Signature::new(role, "n m".to_string(), "e@x".to_string());
+            let parsed = Signature::from_data(sig.to_data().unwrap()).unwrap();
+            assert_eq!(parsed.to_data().unwrap(), sig.to_data().unwrap());
+            assert_eq!(parsed.timezone.len(), 5);
+        }
+        // Non-UTF-8 role is reported as InvalidSignatureType.
+        let mut bad = vec![0xffu8, 0xfe, b' '];
+        bad.extend(b"n <e> 1 +0000");
+        assert!(matches!(
+            Signature::from_data(bad),
+            Err(crate::errors::GitError::InvalidSignatureType(_))
+        ));
     }
 }

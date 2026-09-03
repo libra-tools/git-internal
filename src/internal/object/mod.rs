@@ -597,4 +597,229 @@ mod tests {
             Note::new_with_kind(HashKind::Sha1, sha256_blob.id, "n".to_string()).unwrap_err()
         ));
     }
+
+    /// Commit/Tag/Note reference parsing follows the loaded object's own hash kind
+    /// (40 or 64 hex) regardless of the thread-local kind.
+    #[test]
+    fn reference_parse_context_follows_hash_kind() {
+        for (kind, other) in KINDS {
+            let _guard = set_hash_kind_for_test(other);
+
+            let blob = Blob::from_content_bytes_with_kind(kind, HELLO.to_vec()).unwrap();
+            let tree = Tree::from_tree_items_with_kind(
+                kind,
+                vec![TreeItem::new(
+                    TreeItemMode::Blob,
+                    blob.id,
+                    "hello.txt".to_string(),
+                )],
+            )
+            .unwrap();
+            let root = Commit::from_tree_id_with_kind(kind, tree.id, vec![], "root").unwrap();
+            let child = Commit::new_with_kind(
+                kind,
+                signature(SignatureType::Author),
+                signature(SignatureType::Committer),
+                tree.id,
+                vec![root.id, root.id],
+                "child\n\nbody",
+            )
+            .unwrap();
+
+            let parsed = Commit::from_bytes(&child.to_data().unwrap(), child.id).unwrap();
+            assert_eq!(parsed.tree_id, tree.id);
+            assert_eq!(parsed.tree_id.kind(), kind);
+            assert_eq!(parsed.parent_commit_ids, vec![root.id, root.id]);
+            assert!(parsed.parent_commit_ids.iter().all(|p| p.kind() == kind));
+            assert_eq!(parsed.message, "child\n\nbody");
+            assert_eq!(parsed.to_data().unwrap(), child.to_data().unwrap());
+
+            let tag = Tag::new_with_kind(
+                kind,
+                child.id,
+                ObjectType::Commit,
+                "v1".to_string(),
+                signature(SignatureType::Tagger),
+                "release".to_string(),
+            )
+            .unwrap();
+            let parsed = Tag::from_bytes(&tag.to_data().unwrap(), tag.id).unwrap();
+            assert_eq!(parsed.object_hash, child.id);
+            assert_eq!(parsed.object_hash.kind(), kind);
+
+            let note = Note::new_with_kind(kind, child.id, "annotation".to_string()).unwrap();
+            let parsed = Note::from_bytes(&note.to_data().unwrap(), note.id).unwrap();
+            assert_eq!(parsed.target_object_id, ObjectHash::zero_for_kind(kind));
+            assert_eq!(parsed.target_object_id.kind(), kind);
+            assert_eq!(parsed.content, "annotation");
+        }
+    }
+
+    /// References of the wrong width, non-hex references and truncated bodies fail closed
+    /// (no silent SHA-1 fallback, no panic).
+    #[test]
+    fn reference_parse_context_rejects_cross_kind_and_malformed() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let sha1_id = ObjectHash::new_for_kind(HashKind::Sha1, b"x");
+        let sha256_id = ObjectHash::new_for_kind(HashKind::Sha256, b"x");
+        let author = signature(SignatureType::Author).to_data().unwrap();
+        let committer = signature(SignatureType::Committer).to_data().unwrap();
+        let body = |tree: &str, parent: Option<&str>| {
+            let mut v = format!("tree {tree}\n").into_bytes();
+            if let Some(p) = parent {
+                v.extend(format!("parent {p}\n").into_bytes());
+            }
+            v.extend(&author);
+            v.push(b'\n');
+            v.extend(&committer);
+            v.extend(b"\nmsg");
+            v
+        };
+        let hash_msg = |err: GitError| match err {
+            GitError::InvalidHashValue(msg) => msg,
+            other => panic!("expected InvalidHashValue, got {other:?}"),
+        };
+
+        // 40-hex tree inside a SHA-256 commit: not guessed as SHA-1.
+        let msg =
+            hash_msg(Commit::from_bytes(&body(&sha1_id.to_string(), None), sha256_id).unwrap_err());
+        assert!(msg.contains("tree") && msg.contains("sha256"), "{msg}");
+        assert!(
+            msg.contains("expected 64") && msg.contains("got 40"),
+            "{msg}"
+        );
+
+        // 64-hex parent inside a SHA-1 commit: not guessed as SHA-256.
+        let msg = hash_msg(
+            Commit::from_bytes(
+                &body(&sha1_id.to_string(), Some(&sha256_id.to_string())),
+                sha1_id,
+            )
+            .unwrap_err(),
+        );
+        assert!(
+            msg.contains("parent") && msg.contains("expected 40") && msg.contains("got 64"),
+            "{msg}"
+        );
+
+        // Non-hex tree of the right length.
+        let msg = hash_msg(Commit::from_bytes(&body(&"zz".repeat(20), None), sha1_id).unwrap_err());
+        assert!(msg.contains("tree") && msg.contains("hex"), "{msg}");
+
+        // Truncated / structurally broken bodies: errors, never panics.
+        assert!(matches!(
+            Commit::from_bytes(b"tree abc", sha1_id),
+            Err(GitError::InvalidCommitObject)
+        ));
+        assert!(matches!(
+            Commit::from_bytes(format!("tree {sha1_id}\n").as_bytes(), sha1_id),
+            Err(GitError::InvalidCommitObject)
+        ));
+        assert!(matches!(
+            Commit::from_bytes(format!("blob {sha1_id}\n").as_bytes(), sha1_id),
+            Err(GitError::InvalidCommitObject)
+        ));
+        let mut no_committer = format!("tree {sha1_id}\n").into_bytes();
+        no_committer.extend(&author);
+        assert!(matches!(
+            Commit::from_bytes(&no_committer, sha1_id),
+            Err(GitError::InvalidCommitObject)
+        ));
+
+        // Malformed author/committer lines: signature parsing fails closed (no panic).
+        for bad_sig in [
+            "author",
+            "author name-without-email 1 +0000",
+            "author name <mail 1 +0000",
+            "author name <mail>",
+            "author name <mail> notanumber +0000",
+            "author name <mail> 1",
+            "author name <mail> 1 ",
+            "author name <mail>1 +0000",
+            "author name <mail>x1 +0000",
+            "author name <mail> 1 +08 00",
+            "author name<mail> 1 +0000",
+            "author name <mail> 1 garbage",
+            "author name <mail> 1 0800",
+            "author name <mail> 1 +12345",
+            "author name <mail> 1 +0a00",
+            "committer name <mail> 1 +0000",
+            "xauthor name <mail> 1 +0000",
+            "encoding utf-8",
+        ] {
+            let mut body = format!("tree {sha1_id}\n{bad_sig}\n").into_bytes();
+            body.extend(&committer);
+            body.extend(b"\nmsg");
+            match Commit::from_bytes(&body, sha1_id) {
+                Err(GitError::InvalidSignatureType(_)) | Err(GitError::InvalidCommitObject) => {}
+                Err(GitError::ConversionError(_)) => {}
+                other => panic!("expected a parse error for {bad_sig:?}, got {other:?}"),
+            }
+        }
+        // Edge cases that must parse: empty name, and a body whose author line is preceded
+        // by parents only.
+        let mut empty_name = format!("tree {sha1_id}\nauthor <mail> 1 +0000\n").into_bytes();
+        empty_name.extend(&committer);
+        empty_name.extend(b"\nmsg");
+        let parsed = Commit::from_bytes(&empty_name, sha1_id).unwrap();
+        assert_eq!(parsed.author.name, "");
+        assert_eq!(parsed.author.email, "mail");
+        assert_eq!(parsed.author.timestamp, 1);
+        assert_eq!(parsed.author.timezone, "+0000");
+        let mut negative_tz = format!("tree {sha1_id}\nauthor a b <m> 7 -0530\n").into_bytes();
+        negative_tz.extend(&committer);
+        negative_tz.extend(b"\nmsg");
+        let parsed = Commit::from_bytes(&negative_tz, sha1_id).unwrap();
+        assert_eq!(parsed.author.name, "a b");
+        assert_eq!(parsed.author.timezone, "-0530");
+        // `committer` line must follow `author` directly.
+        let mut two_authors = format!("tree {sha1_id}\n").into_bytes();
+        two_authors.extend(&author);
+        two_authors.push(b'\n');
+        two_authors.extend(&author);
+        two_authors.extend(b"\nmsg");
+        assert!(matches!(
+            Commit::from_bytes(&two_authors, sha1_id),
+            Err(GitError::InvalidCommitObject)
+        ));
+        let mut non_utf8 = format!("tree {sha1_id}\nauthor ").into_bytes();
+        non_utf8.extend_from_slice(&[0xff, 0xfe]);
+        non_utf8.extend(b" <m> 1 +0000\n");
+        non_utf8.extend(&committer);
+        non_utf8.extend(b"\nmsg");
+        assert!(matches!(
+            Commit::from_bytes(&non_utf8, sha1_id),
+            Err(GitError::InvalidSignatureType(_))
+        ));
+
+        // Tag object reference of the wrong width for the tag's kind.
+        let tag_body = format!(
+            "object {sha1_id}\ntype commit\ntag v1\n{}\n\nmsg",
+            String::from_utf8(signature(SignatureType::Tagger).to_data().unwrap()).unwrap()
+        );
+        match Tag::from_bytes(tag_body.as_bytes(), sha256_id) {
+            Err(GitError::InvalidTagObject(msg)) => {
+                assert!(
+                    msg.contains("sha256") && msg.contains("expected 64"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected InvalidTagObject, got {other:?}"),
+        }
+        // Non-UTF-8 object id: diagnostic carries kind and expected/actual lengths.
+        let mut raw_tag = b"object ".to_vec();
+        raw_tag.extend_from_slice(&[0xffu8; 40]);
+        raw_tag.extend(b"\ntype commit\ntag v1\n");
+        match Tag::from_bytes(&raw_tag, sha1_id) {
+            Err(GitError::InvalidTagObject(msg)) => {
+                assert!(
+                    msg.contains("sha1")
+                        && msg.contains("expected 40")
+                        && msg.contains("got 40 bytes"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected InvalidTagObject, got {other:?}"),
+        }
+    }
 }
