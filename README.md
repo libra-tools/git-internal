@@ -39,6 +39,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `protocol/*`: smart protocol + HTTP/SSH adapters, wrapping info-refs/upload-pack/receive-pack. `object-format=sha1|sha256` are the standard Git formats; `object-format=blake3` is a git-internal / Libra extension (not understood by unmodified Git), negotiated fail-closed against the repository's `object_hash_kind()`.
 - Docs: [docs/ARCHITECTURE.md (architecture)](docs/ARCHITECTURE.md), [docs/git-object.md (objects)](docs/git-object.md), [docs/git-protocol-guide.md (protocol)](docs/git-protocol-guide.md), [docs/agent.md (AI objects)](docs/agent.md).
 
+## Hash Algorithms
+
+Object IDs support SHA-1 (20 bytes / 40 hex) and SHA-256 (32 bytes / 64 hex) — the standard Git formats — plus BLAKE3-256 (32 bytes / 64 hex) as a **git-internal / Libra extension**. The algorithm is configured per repository (`set_hash_kind`, or the explicit `*_for_kind` APIs).
+
+BLAKE3 support comes with the following compatibility limitations:
+
+- **No interoperability with unmodified Git.** `object-format=blake3` is understood only by git-internal / Libra peers. Standard Git clients and servers do not recognize this capability (no upstream BLAKE3 specification exists yet), and protocol negotiation fails closed rather than falling back to another format.
+- **No in-place migration.** Existing SHA-1 / SHA-256 repositories cannot be converted to BLAKE3. BLAKE3 object IDs are produced only by repositories created with `core.objectformat=blake3`.
+- **Pack files cannot be hash-kind-sniffed.** SHA-256 and BLAKE3 digests share the same 32-byte width, and the pack header does not record the hash algorithm, so a reader cannot tell the two apart from the bytes alone — the repository's hash kind must be supplied explicitly (e.g. `Pack::new_with_hash_kind`). This is a deliberate consequence of the same-width design, not a defect.
+
 ## Key Features
 
 ### 1. Multi-threaded Processing
