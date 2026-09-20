@@ -763,14 +763,17 @@ impl Pack {
         reader
             .read_exact(&mut magic)
             .map_err(|e| GitError::InvalidPackFile(format!("Read pack index magic error: {e}")))?;
-        let parsed = if magic == pack_index::IDX_MAGIC.to_be_bytes() {
-            pack_index::parse_idx_v2_from(io::Cursor::new(magic).chain(reader), kind, idx_len)?
+        let (parsed, crcs_known) = if magic == pack_index::IDX_MAGIC.to_be_bytes() {
+            (
+                pack_index::parse_idx_v2_from(io::Cursor::new(magic).chain(reader), kind, idx_len)?,
+                true,
+            )
         } else if kind == HashKind::Sha1 {
             let mut bytes = magic.to_vec();
             reader
                 .read_to_end(&mut bytes)
                 .map_err(|e| GitError::InvalidPackFile(format!("Read pack index v1 error: {e}")))?;
-            pack_index::parse_idx_v1(&bytes)?
+            (pack_index::parse_idx_v1(&bytes)?, false)
         } else {
             return Err(GitError::InvalidPackFile(format!(
                 "Pack index {} is neither v2 nor a SHA-1 v1 index ({kind} repository)",
@@ -856,10 +859,18 @@ impl Pack {
             }
         }
 
-        let object_crcs = objects_by_offset
-            .iter()
-            .map(|(_, _, crc)| *crc)
-            .collect::<Vec<_>>();
+        // v1 indexes carry no CRC table: report unknown so the decoder skips
+        // the per-object CRC comparison instead of failing on the zero placeholders.
+        let object_crcs = if crcs_known {
+            Some(
+                objects_by_offset
+                    .iter()
+                    .map(|(_, _, crc)| *crc)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
         let object_offsets = objects_by_offset
             .iter()
             .map(|(offset, _, _)| *offset)
@@ -872,7 +883,7 @@ impl Pack {
         Ok(DecodeScan {
             retention,
             object_hashes: Some(object_hashes),
-            object_crcs: Some(object_crcs),
+            object_crcs,
             object_offsets: Some(object_offsets),
             pack_hash: Some(pack_hash),
             pack_hash_check: None,

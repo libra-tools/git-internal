@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2026-09-20
+
+### Fixed
+
+- The v1 pack-index fallback in `Pack::decode`'s retention scan now reports
+  unknown CRCs (`object_crcs: None`) instead of zero placeholders, so decoding
+  a SHA-1 pack with a legacy v1 index skips the per-object CRC comparison
+  rather than failing it (v1 indexes have no CRC table).
+
 ## [0.10.1] - 2026-09-20
 
 ### Fixed
