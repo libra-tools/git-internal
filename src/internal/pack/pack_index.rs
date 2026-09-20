@@ -258,6 +258,90 @@ pub struct IdxBuilder {
     pack_hash: ObjectHash,
 }
 
+/// Parse a legacy pack index v1 (SHA-1 only, no magic/version header) into the
+/// same [`IdxV2`] shape; v1 has no CRC table, so every entry reports
+/// `crc32 = 0` (an unknown CRC). Both trailer checksums are verified.
+///
+/// Libra's `index-pack`/`bundle`/`fetch` paths still emit v1 indexes for SHA-1
+/// repositories, and `Pack::decode`'s dependency scan must keep reading packs
+/// whose sibling index is v1.
+pub fn parse_idx_v1(bytes: &[u8]) -> Result<IdxV2, GitError> {
+    const FANOUT_LEN: usize = 256 * 4;
+    const ENTRY_LEN: usize = 4 + 20;
+    const TRAILER_LEN: usize = 20 + 20;
+    if bytes.len() < FANOUT_LEN + TRAILER_LEN {
+        return Err(GitError::InvalidPackFile(
+            "pack index v1 is too short".to_string(),
+        ));
+    }
+    let mut fanout = [0u32; 256];
+    for (slot, chunk) in bytes[..FANOUT_LEN].as_chunks::<4>().0.iter().enumerate() {
+        fanout[slot] = u32::from_be_bytes(*chunk);
+    }
+    for pair in fanout.windows(2) {
+        if pair[0] > pair[1] {
+            return Err(GitError::InvalidPackFile(
+                "pack index v1 fanout table is not monotonic".to_string(),
+            ));
+        }
+    }
+    let object_count = fanout[255] as usize;
+    let expected_len = FANOUT_LEN
+        .checked_add(object_count.saturating_mul(ENTRY_LEN))
+        .and_then(|len| len.checked_add(TRAILER_LEN))
+        .ok_or_else(|| GitError::InvalidPackFile("pack index v1 size overflow".to_string()))?;
+    if bytes.len() != expected_len {
+        return Err(GitError::InvalidPackFile(format!(
+            "pack index v1 length {} does not match fanout object count {object_count}",
+            bytes.len()
+        )));
+    }
+    let trailer_start = FANOUT_LEN + object_count * ENTRY_LEN;
+    let mut hasher = HashAlgorithm::new_for_kind(HashKind::Sha1);
+    hasher.update(&bytes[..trailer_start + 20]);
+    let computed = hasher.finalize_object_hash();
+    let idx_hash_bytes = &bytes[trailer_start + 20..trailer_start + 40];
+    if computed.as_ref() != idx_hash_bytes {
+        return Err(GitError::InvalidPackFile(
+            "pack index v1 checksum mismatch".to_string(),
+        ));
+    }
+    let pack_hash = ObjectHash::Sha1(
+        bytes[trailer_start..trailer_start + 20]
+            .try_into()
+            .map_err(|_| GitError::InvalidPackFile("pack index v1 pack hash".to_string()))?,
+    );
+    let idx_hash = ObjectHash::Sha1(
+        idx_hash_bytes
+            .try_into()
+            .map_err(|_| GitError::InvalidPackFile("pack index v1 idx hash".to_string()))?,
+    );
+    let mut entries = Vec::with_capacity(object_count);
+    for index in 0..object_count {
+        let start = FANOUT_LEN + index * ENTRY_LEN;
+        let offset = u32::from_be_bytes(
+            bytes[start..start + 4]
+                .try_into()
+                .map_err(|_| GitError::InvalidPackFile("pack index v1 offset".to_string()))?,
+        ) as u64;
+        let hash = ObjectHash::Sha1(
+            bytes[start + 4..start + ENTRY_LEN]
+                .try_into()
+                .map_err(|_| GitError::InvalidPackFile("pack index v1 object name".to_string()))?,
+        );
+        entries.push(IndexEntry {
+            hash,
+            crc32: 0,
+            offset,
+        });
+    }
+    Ok(IdxV2 {
+        entries,
+        pack_hash,
+        idx_hash,
+    })
+}
+
 impl IdxBuilder {
     /// Create a new IdxBuilder.
     ///
@@ -785,5 +869,45 @@ mod tests {
         assert_eq!(parsed.pack_hash, pack_hash);
         assert!(super::parse_idx_v2(&out, HashKind::Blake3).is_err());
         Ok(())
+    }
+
+    /// Legacy v1 pack indexes (SHA-1, no magic) parse into the same shape and
+    /// verify their checksum; v1 has no CRC table, so CRCs report 0.
+    #[test]
+    fn parse_idx_v1_reads_entries_and_verifies_checksum() {
+        use crate::{
+            hash::{HashKind, ObjectHash},
+            utils::HashAlgorithm,
+        };
+
+        let object_hash = ObjectHash::Sha1([0x42u8; 20]);
+        let pack_hash = ObjectHash::Sha1([0x77u8; 20]);
+        let mut bytes = vec![0u8; 256 * 4];
+        for slot in 0x42..256usize {
+            bytes[slot * 4..slot * 4 + 4].copy_from_slice(&1u32.to_be_bytes());
+        }
+        bytes.extend_from_slice(&12u32.to_be_bytes());
+        bytes.extend_from_slice(object_hash.as_ref());
+        bytes.extend_from_slice(pack_hash.as_ref());
+        let mut hasher = HashAlgorithm::new_for_kind(HashKind::Sha1);
+        hasher.update(&bytes);
+        let idx_hash = hasher.finalize_object_hash();
+        bytes.extend_from_slice(idx_hash.as_ref());
+
+        let parsed = super::parse_idx_v1(&bytes).expect("v1 index must parse");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].hash, object_hash);
+        assert_eq!(parsed.entries[0].offset, 12);
+        assert_eq!(parsed.entries[0].crc32, 0, "v1 carries no CRC table");
+        assert_eq!(parsed.pack_hash, pack_hash);
+        assert_eq!(parsed.idx_hash, idx_hash);
+
+        let mut corrupt = bytes.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        assert!(
+            super::parse_idx_v1(&corrupt).is_err(),
+            "checksum must fail closed"
+        );
     }
 }

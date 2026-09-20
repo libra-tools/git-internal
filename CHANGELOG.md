@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-09-20
+
+### Fixed
+
+- `Pack::decode`'s index retention scan no longer rejects a legacy v1 pack
+  index: a SHA-1 pack whose sibling `.idx` has no `\xfftOc` magic is read with
+  the new `parse_idx_v1` (fanout/entries validated, checksum verified, CRCs
+  reported as 0 because v1 has no CRC table). Cases that still fail closed are
+  unchanged: non-v1 non-v2 indexes and v1 indexes in a non-SHA-1 repository.
+
 ## [0.10.0] - 2026-09-20
 
 Git index version 3 with the extended flags word, as required by Libra's

@@ -754,9 +754,29 @@ impl Pack {
             .metadata()
             .map_err(|e| GitError::InvalidPackFile(format!("Read pack index metadata error: {e}")))?
             .len();
-        // Shared, streaming, size-bounded idx reader (magic/version, fanout, names, CRCs,
-        // offsets incl. the 8-byte table, both checksums, no trailing data).
-        let parsed = pack_index::parse_idx_v2_from(io::BufReader::new(idx_file), kind, idx_len)?;
+        // Shared, streaming, size-bounded v2 reader (magic/version, fanout, names, CRCs,
+        // offsets incl. the 8-byte table, both checksums, no trailing data). Legacy v1
+        // indexes (SHA-1 only, no magic) are still produced by Libra's `index-pack` /
+        // `fetch` / `bundle` paths, so read those too instead of failing the decode.
+        let mut reader = io::BufReader::new(idx_file);
+        let mut magic = [0u8; 4];
+        reader
+            .read_exact(&mut magic)
+            .map_err(|e| GitError::InvalidPackFile(format!("Read pack index magic error: {e}")))?;
+        let parsed = if magic == pack_index::IDX_MAGIC.to_be_bytes() {
+            pack_index::parse_idx_v2_from(io::Cursor::new(magic).chain(reader), kind, idx_len)?
+        } else if kind == HashKind::Sha1 {
+            let mut bytes = magic.to_vec();
+            reader
+                .read_to_end(&mut bytes)
+                .map_err(|e| GitError::InvalidPackFile(format!("Read pack index v1 error: {e}")))?;
+            pack_index::parse_idx_v1(&bytes)?
+        } else {
+            return Err(GitError::InvalidPackFile(format!(
+                "Pack index {} is neither v2 nor a SHA-1 v1 index ({kind} repository)",
+                idx_path.display()
+            )));
+        };
         let object_num = parsed.entries.len();
         let mut objects_by_offset = parsed
             .entries
