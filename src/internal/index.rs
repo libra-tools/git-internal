@@ -104,12 +104,21 @@ fn unix_metadata_time(seconds: i64, nanos: i64) -> SystemTime {
 }
 
 /// 16 bits
+///
+/// `skip_worktree` and `intent_to_add` live in the on-disk *extended* flags
+/// word (index v3, `CE_EXTENDED`); `extended` records whether that second word
+/// is present. The reader fills all three; the writer derives the on-disk
+/// `CE_EXTENDED` bit from the extended word (or an explicit `extended`).
 #[derive(Debug)]
 pub struct Flags {
     pub assume_valid: bool,
     pub extended: bool,   // must be 0 in v2
     pub stage: u8,        // 2-bit during merge
     pub name_length: u16, // 12-bit
+    /// `CE_SKIP_WORKTREE` (extended flags bit `0x4000`).
+    pub skip_worktree: bool,
+    /// `CE_INTENT_TO_ADD` (extended flags bit `0x2000`).
+    pub intent_to_add: bool,
 }
 
 impl From<u16> for Flags {
@@ -119,6 +128,8 @@ impl From<u16> for Flags {
             extended: flags & 0x4000 != 0,
             stage: ((flags & 0x3000) >> 12) as u8,
             name_length: flags & 0xFFF,
+            skip_worktree: false,
+            intent_to_add: false,
         }
     }
 }
@@ -143,13 +154,46 @@ impl TryInto<u16> for &Flags {
 }
 
 impl Flags {
+    /// The on-disk extended flag `CE_SKIP_WORKTREE`.
+    pub const EXTENDED_FLAG_SKIP_WORKTREE: u16 = 0x4000;
+    /// The on-disk extended flag `CE_INTENT_TO_ADD`.
+    pub const EXTENDED_FLAG_INTENT_TO_ADD: u16 = 0x2000;
+
     pub fn new(name_len: u16) -> Self {
         Flags {
             assume_valid: true,
             extended: false,
             stage: 0,
             name_length: name_len,
+            skip_worktree: false,
+            intent_to_add: false,
         }
+    }
+
+    /// Decode the 16-bit extended flags word, failing closed on unknown bits.
+    pub fn from_extended_word(word: u16) -> Result<(bool, bool), GitError> {
+        const KNOWN: u16 = Flags::EXTENDED_FLAG_SKIP_WORKTREE | Flags::EXTENDED_FLAG_INTENT_TO_ADD;
+        if word & !KNOWN != 0 {
+            return Err(GitError::InvalidIndexFile(format!(
+                "index entry has unknown extended flags 0x{word:04x}"
+            )));
+        }
+        Ok((
+            word & Flags::EXTENDED_FLAG_SKIP_WORKTREE != 0,
+            word & Flags::EXTENDED_FLAG_INTENT_TO_ADD != 0,
+        ))
+    }
+
+    /// The extended flags word to write, or `None` when no extended bit is set.
+    pub fn extended_word(&self) -> Option<u16> {
+        let mut word = 0u16;
+        if self.skip_worktree {
+            word |= Flags::EXTENDED_FLAG_SKIP_WORKTREE;
+        }
+        if self.intent_to_add {
+            word |= Flags::EXTENDED_FLAG_INTENT_TO_ADD;
+        }
+        (word != 0).then_some(word)
     }
 }
 
@@ -277,7 +321,9 @@ impl Index {
         }
     }
 
-    fn check_header(file: &mut impl Read) -> Result<u32, GitError> {
+    /// Parse and validate the `DIRC` header, returning `(version, entry_count)`.
+    /// Versions 2 and 3 are accepted; anything else fails closed.
+    fn check_header(file: &mut impl Read) -> Result<(u32, u32), GitError> {
         let mut magic = [0; 4];
         file.read_exact(&mut magic)?;
         if magic != *b"DIRC" {
@@ -287,13 +333,13 @@ impl Index {
         }
 
         let version = file.read_u32::<BigEndian>()?;
-        // only support v2 now
-        if version != 2 {
+        // v3 adds the per-entry extended flags word; later versions are unsupported.
+        if version != 2 && version != 3 {
             return Err(GitError::InvalidIndexHeader(version.to_string()));
         }
 
         let entries = file.read_u32::<BigEndian>()?;
-        Ok(entries)
+        Ok((version, entries))
     }
 
     pub fn size(&self) -> usize {
@@ -317,7 +363,7 @@ impl Index {
         let total_size = file.metadata()?.len();
         let file = &mut Wrapper::new_with_kind(BufReader::new(file), kind); // TODO move Wrapper & utils to a common module
 
-        let num = Index::check_header(file)?;
+        let (_version, num) = Index::check_header(file)?;
         let mut index = Index::new();
 
         for _ in 0..num {
@@ -334,20 +380,30 @@ impl Index {
                 flags: Flags::from(file.read_u16::<BigEndian>()?),
                 name: String::new(),
             };
+            // v3 entries with CE_EXTENDED carry a second flags word directly
+            // after the main word and before the name (index-format(5)).
+            if entry.flags.extended {
+                let word = file.read_u16::<BigEndian>()?;
+                let (skip_worktree, intent_to_add) = Flags::from_extended_word(word)?;
+                entry.flags.skip_worktree = skip_worktree;
+                entry.flags.intent_to_add = intent_to_add;
+            }
             let name_len = entry.flags.name_length as usize;
             let mut name = vec![0; name_len];
             file.read_exact(&mut name)?;
             // The exact encoding is undefined, but the '.' and '/' characters are encoded in 7-bit ASCII
             entry.name =
                 String::from_utf8(name).map_err(|e| GitError::ConversionError(e.to_string()))?; // TODO check the encoding
+            let extended = entry.flags.extended;
             index
                 .entries
                 .insert((entry.name.clone(), entry.flags.stage), entry);
 
             // 1-8 nul bytes as necessary to pad the entry to a multiple of eight bytes
-            // while keeping the name NUL-terminated.
+            // while keeping the name NUL-terminated. The extended flags word, when
+            // present, is part of the padded entry length.
             let hash_len = kind.size();
-            let entry_len = hash_len + 2 + name_len;
+            let entry_len = hash_len + 2 + if extended { 2 } else { 0 } + name_len;
             let padding = 1 + ((8 - ((entry_len + 1) % 8)) % 8); // at least 1 byte nul
             utils::read_bytes(file, padding)?;
         }
@@ -405,9 +461,16 @@ impl Index {
         let mut file = File::create(path)?;
         let mut hash = HashAlgorithm::new_for_kind(kind);
 
+        // Any entry carrying an extended flags word forces the whole index to v3;
+        // otherwise the output stays byte-identical to the v2 writer.
+        let any_extended = self
+            .entries
+            .values()
+            .any(|entry| entry.flags.extended_word().is_some() || entry.flags.extended);
+
         let mut header = Vec::new();
         header.write_all(b"DIRC")?;
-        header.write_u32::<BigEndian>(2u32)?; // version 2
+        header.write_u32::<BigEndian>(if any_extended { 3u32 } else { 2u32 })?;
         header.write_u32::<BigEndian>(self.entries.len() as u32)?;
         file.write_all(&header)?;
         hash.update(&header);
@@ -425,10 +488,27 @@ impl Index {
             entry_bytes.write_u32::<BigEndian>(entry.gid)?;
             entry_bytes.write_u32::<BigEndian>(entry.size)?;
             entry_bytes.write_all(entry.hash.as_ref())?;
-            entry_bytes.write_u16::<BigEndian>((&entry.flags).try_into().unwrap())?;
+            // An explicit `extended` with no known bit still emits a zero word so
+            // the on-disk layout stays self-consistent.
+            let extended_word = entry.flags.extended_word().or(if entry.flags.extended {
+                Some(0u16)
+            } else {
+                None
+            });
+            let mut packed: u16 = (&entry.flags).try_into().map_err(|error| {
+                GitError::InvalidIndexFile(format!("cannot encode index flags: {error}"))
+            })?;
+            if extended_word.is_some() {
+                packed |= 0x4000; // CE_EXTENDED
+            }
+            entry_bytes.write_u16::<BigEndian>(packed)?;
+            if let Some(word) = extended_word {
+                entry_bytes.write_u16::<BigEndian>(word)?;
+            }
             entry_bytes.write_all(entry.name.as_bytes())?;
             let hash_len = kind.size();
-            let entry_len = hash_len + 2 + entry.name.len();
+            let entry_len =
+                hash_len + 2 + if extended_word.is_some() { 2 } else { 0 } + entry.name.len();
             let padding = 1 + ((8 - ((entry_len + 1) % 8)) % 8); // at least 1 byte nul
             entry_bytes.write_all(&vec![0; padding])?;
             file.write_all(&entry_bytes)?;
@@ -658,7 +738,8 @@ mod tests {
         source.push("tests/data/index/index-2");
 
         let file = File::open(source).unwrap();
-        let entries = Index::check_header(&mut BufReader::new(file)).unwrap();
+        let (version, entries) = Index::check_header(&mut BufReader::new(file)).unwrap();
+        assert_eq!(version, 2);
         assert_eq!(entries, 2);
     }
 
@@ -698,6 +779,8 @@ mod tests {
             extended: true,
             stage: 2,
             name_length: 0x0ABC,
+            skip_worktree: false,
+            intent_to_add: false,
         };
         let packed: u16 = (&flags).try_into().expect("should pack");
         let unpacked = Flags::from(packed);
@@ -752,21 +835,30 @@ mod tests {
         assert!(index.get("a/b.txt", 0).is_none());
     }
 
-    /// check_header should reject bad magic/versions and accept valid header.
+    /// check_header should reject bad magic/versions and accept valid headers.
     #[test]
     fn check_header_validation() {
         // valid header: "DIRC" + version 2 + 0 entries
         let mut valid = Cursor::new(b"DIRC\0\0\0\x02\0\0\0\0".to_vec());
-        let entries = Index::check_header(&mut valid).expect("valid header");
+        let (version, entries) = Index::check_header(&mut valid).expect("valid header");
+        assert_eq!(version, 2);
+        assert_eq!(entries, 0);
+
+        // v3 is accepted: it only adds an optional per-entry extended flags word
+        let mut v3 = Cursor::new(b"DIRC\0\0\0\x03\0\0\0\0".to_vec());
+        let (version, entries) = Index::check_header(&mut v3).expect("v3 header");
+        assert_eq!(version, 3);
         assert_eq!(entries, 0);
 
         // bad magic
         let mut bad_magic = Cursor::new(b"XXXX\0\0\0\x02\0\0\0\0".to_vec());
         assert!(Index::check_header(&mut bad_magic).is_err());
 
-        // bad version
+        // unsupported versions (1 and 4) fail closed
         let mut bad_version = Cursor::new(b"DIRC\0\0\0\x01\0\0\0\0".to_vec());
         assert!(Index::check_header(&mut bad_version).is_err());
+        let mut v4 = Cursor::new(b"DIRC\0\0\0\x04\0\0\0\0".to_vec());
+        assert!(Index::check_header(&mut v4).is_err());
     }
 
     /// Test saving Index to file
@@ -782,6 +874,116 @@ mod tests {
         index.to_file(&temp_path).unwrap();
         let new_index = Index::from_file(temp_path).unwrap();
         assert_eq!(index.size(), new_index.size());
+    }
+
+    /// A real index v3 generated by git 2.55.0 (SHA-1) with one skip-worktree
+    /// entry (`a.txt`): header v3, entry flags `0x4005`, extended word `0x4000`.
+    const GIT_V3_SKIP_WORKTREE_FIXTURE: [u8; 104] = [
+        0x44, 0x49, 0x52, 0x43, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x6a, 0xaf, 0x4a,
+        0x7b, 0x10, 0xbe, 0x36, 0x0a, 0x6a, 0xaf, 0x4a, 0x7b, 0x10, 0xbe, 0x36, 0x0a, 0x00, 0x00,
+        0x00, 0x3a, 0x06, 0x98, 0x73, 0xd9, 0x00, 0x00, 0x81, 0xa4, 0x00, 0x00, 0x03, 0xe8, 0x00,
+        0x00, 0x03, 0xe8, 0x00, 0x00, 0x00, 0x03, 0x45, 0xb9, 0x83, 0xbe, 0x36, 0xb7, 0x3c, 0x07,
+        0x88, 0xdc, 0x9c, 0xbc, 0xb7, 0x6c, 0xbb, 0x80, 0xfc, 0x7b, 0xb0, 0x57, 0x40, 0x05, 0x40,
+        0x00, 0x61, 0x2e, 0x74, 0x78, 0x74, 0x00, 0x00, 0x00, 0x32, 0xd2, 0xa6, 0x5d, 0x73, 0x12,
+        0x16, 0x5a, 0x7f, 0x63, 0xda, 0x76, 0xd4, 0xd0, 0xaa, 0xc8, 0xab, 0xc4, 0xc0, 0x06,
+    ];
+
+    /// A git-generated v3 index with `CE_SKIP_WORKTREE` reads back with the bit set.
+    #[test]
+    fn index_reads_git_v3_skip_worktree_fixture() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("index-v3-git");
+        std::fs::write(&path, GIT_V3_SKIP_WORKTREE_FIXTURE).unwrap();
+
+        let index = Index::from_file(&path).unwrap();
+        assert_eq!(index.size(), 1);
+        let entry = index.get("a.txt", 0).expect("fixture entry");
+        assert_eq!(entry.mode, 0o100644);
+        assert!(entry.flags.skip_worktree, "CE_SKIP_WORKTREE must be set");
+        assert!(!entry.flags.intent_to_add);
+    }
+
+    /// An unknown extended bit fails closed instead of being silently dropped.
+    #[test]
+    fn index_rejects_unknown_extended_bit() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("index-bad-extended");
+
+        let mut raw = GIT_V3_SKIP_WORKTREE_FIXTURE.to_vec();
+        raw[74] = 0x10; // extended word 0x4000 -> 0x1000 (unknown bit)
+        raw[75] = 0x00;
+        let mut hasher = HashAlgorithm::new_for_kind(HashKind::Sha1);
+        hasher.update(&raw[..raw.len() - 20]);
+        let checksum = hasher.finalize_object_hash();
+        raw.truncate(raw.len() - 20);
+        raw.extend_from_slice(checksum.as_ref());
+        std::fs::write(&path, &raw).unwrap();
+
+        let error = match Index::from_file(&path) {
+            Ok(_) => panic!("an index with an unknown extended bit must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, GitError::InvalidIndexFile(_)),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// Writing extended flags forces index v3 and survives a round trip.
+    #[test]
+    fn index_v3_round_trip_preserves_extended_flags() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("index-v3-round-trip");
+
+        let mut index = Index::new();
+        let hash = ObjectHash::from_bytes(&[0x11u8; 20]).unwrap();
+        let mut skip = IndexEntry::new_from_blob("skip.txt".to_string(), hash, 7);
+        skip.flags.skip_worktree = true;
+        index.update(skip);
+        let hash = ObjectHash::from_bytes(&[0x22u8; 20]).unwrap();
+        let mut ita = IndexEntry::new_from_blob("ita.txt".to_string(), hash, 9);
+        ita.flags.intent_to_add = true;
+        index.update(ita);
+
+        index.to_file(&path).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(&raw[..4], b"DIRC");
+        assert_eq!(
+            u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]),
+            3,
+            "extended flags must force version 3"
+        );
+
+        let loaded = Index::from_file(&path).unwrap();
+        let skip = loaded.get("skip.txt", 0).unwrap();
+        assert!(skip.flags.skip_worktree);
+        assert!(!skip.flags.intent_to_add);
+        let ita = loaded.get("ita.txt", 0).unwrap();
+        assert!(ita.flags.intent_to_add);
+        assert!(!ita.flags.skip_worktree);
+    }
+
+    /// Without extended bits the writer keeps emitting v2.
+    #[test]
+    fn index_without_extended_flags_stays_v2() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("index-v2-round-trip");
+
+        let mut index = Index::new();
+        let hash = ObjectHash::from_bytes(&[0x33u8; 20]).unwrap();
+        index.update(IndexEntry::new_from_blob("plain.txt".to_string(), hash, 3));
+        index.to_file(&path).unwrap();
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]), 2);
+        let loaded = Index::from_file(&path).unwrap();
+        let entry = loaded.get("plain.txt", 0).unwrap();
+        assert!(!entry.flags.skip_worktree);
+        assert!(!entry.flags.intent_to_add);
     }
 
     /// Test IndexEntry creation from file

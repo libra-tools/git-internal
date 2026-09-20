@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-09-20
+
+Git index version 3 with the extended flags word, as required by Libra's
+skip-worktree / intent-to-add plans (libra issue #490, ADR-SW-02). This is a
+`0.x` breaking minor: `Flags` gains public fields.
+
+### Added
+
+- `Flags::skip_worktree` / `Flags::intent_to_add` and the
+  `extended` word helpers `Flags::from_extended_word` (fails closed on unknown
+  bits) and `Flags::extended_word`.
+- Reading and writing index version 3: an entry with `CE_EXTENDED` carries a
+  second flags word directly after the main word and before the name; the
+  writer emits version 3 exactly when some entry has an extended bit and
+  otherwise keeps the byte-identical v2 output.
+
+### Changed
+
+- `Index::check_header` now returns `(version, entry_count)` and accepts both
+  version 2 and version 3; version 4 and anything else still fail closed with
+  `GitError::InvalidIndexHeader`.
+
 ## [0.9.0] - 2026-09-04
 
 BLAKE3-256 object IDs as a git-internal / Libra extension, with an explicit-kind
