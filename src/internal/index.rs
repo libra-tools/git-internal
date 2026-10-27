@@ -159,9 +159,15 @@ impl Flags {
     /// The on-disk extended flag `CE_INTENT_TO_ADD`.
     pub const EXTENDED_FLAG_INTENT_TO_ADD: u16 = 0x2000;
 
+    /// Flags for an ordinary stage-0 entry.
+    ///
+    /// `assume_valid` (`CE_VALID`, Git's assume-unchanged bit) is `false`: Git only
+    /// sets it on an explicit `update-index --assume-unchanged` (or `core.ignorestat`),
+    /// and a reader that sees it skips the worktree stat, hiding later edits and
+    /// deletions. Callers that want the bit must set it explicitly.
     pub fn new(name_len: u16) -> Self {
         Flags {
-            assume_valid: true,
+            assume_valid: false,
             extended: false,
             stage: 0,
             name_length: name_len,
@@ -822,6 +828,71 @@ mod tests {
         assert_eq!(entry.hash, hash);
         assert_eq!(entry.flags.name_length, "file.txt".len() as u16);
         assert_eq!(entry.mode, 0o100644);
+    }
+
+    /// Regression test for <https://github.com/libra-tools/git-internal/issues/184>:
+    /// `Flags::new` and every `IndexEntry::new*` constructor must not set
+    /// `assume_valid` (`CE_VALID`), which would make Git ignore worktree changes.
+    #[test]
+    fn new_entries_do_not_set_assume_valid() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        assert!(!Flags::new(8).assume_valid);
+
+        let hash = ObjectHash::from_bytes(&[0u8; 20]).unwrap();
+        let from_blob = IndexEntry::new_from_blob("file.txt".to_string(), hash, 42);
+        assert!(!from_blob.flags.assume_valid, "new_from_blob");
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let work = temp_dir.path();
+        std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+        let from_file = IndexEntry::new_from_file(Path::new("a.txt"), hash, work).unwrap();
+        assert!(!from_file.flags.assume_valid, "new_from_file");
+
+        let meta = std::fs::symlink_metadata(work.join("a.txt")).unwrap();
+        let from_meta = IndexEntry::new(&meta, hash, "a.txt".to_string());
+        assert!(!from_meta.flags.assume_valid, "new");
+    }
+
+    /// An ordinary entry is written without `CE_VALID` (`0x8000`), while an entry with
+    /// an explicit `assume_valid = true` keeps the bit on disk and after reading back.
+    #[test]
+    fn assume_valid_is_written_only_when_explicitly_set() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let hash = ObjectHash::from_bytes(&[0x44u8; 20]).unwrap();
+
+        // Header (12) + stat fields (40) + hash (20): offset of the first entry's flags.
+        let flags_offset = 12 + 40 + HashKind::Sha1.size();
+        let flags_word =
+            |raw: &[u8]| u16::from_be_bytes([raw[flags_offset], raw[flags_offset + 1]]);
+
+        let plain_path = temp_dir.path().join("index-plain");
+        let mut plain = Index::new();
+        plain.add(IndexEntry::new_from_blob("plain.txt".to_string(), hash, 3));
+        plain.to_file(&plain_path).unwrap();
+        let raw = std::fs::read(&plain_path).unwrap();
+        assert_eq!(
+            flags_word(&raw) & 0x8000,
+            0,
+            "ordinary entry must not carry CE_VALID"
+        );
+        let loaded = Index::from_file(&plain_path).unwrap();
+        assert!(!loaded.get("plain.txt", 0).unwrap().flags.assume_valid);
+
+        let valid_path = temp_dir.path().join("index-assume-valid");
+        let mut valid = Index::new();
+        let mut entry = IndexEntry::new_from_blob("valid.txt".to_string(), hash, 3);
+        entry.flags.assume_valid = true;
+        valid.add(entry);
+        valid.to_file(&valid_path).unwrap();
+        let raw = std::fs::read(&valid_path).unwrap();
+        assert_eq!(
+            flags_word(&raw) & 0x8000,
+            0x8000,
+            "explicit CE_VALID must be written"
+        );
+        let loaded = Index::from_file(&valid_path).unwrap();
+        assert!(loaded.get("valid.txt", 0).unwrap().flags.assume_valid);
     }
 
     /// Index container operations: add/get/tracked/dir helpers.

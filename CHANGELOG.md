@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.4] - 2026-10-27
+
+### Fixed
+
+- `Flags::new()` no longer sets `assume_valid` (issue #184). Every entry built by
+  `IndexEntry::new`, `IndexEntry::new_from_file` and `IndexEntry::new_from_blob`
+  was previously written with `CE_VALID` (`0x8000`, Git's assume-unchanged bit),
+  so Git reading such an index skipped the worktree stat and silently ignored
+  modifications and deletions (`git status` / `git commit -a` saw nothing).
+  Reading is unchanged: a `CE_VALID` bit present on disk is still preserved
+  through a round trip.
+
+### Changed
+
+- The default of `Flags::new().assume_valid` is now `false`. Callers that need
+  the assume-unchanged bit must set `entry.flags.assume_valid = true`
+  explicitly. Indexes already written with the bit keep it after loading; a
+  downstream that does not support assume-unchanged should clear it itself.
+
 ## [0.10.3] - 2026-10-04
 
 ### Fixed
